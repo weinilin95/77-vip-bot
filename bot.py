@@ -21,6 +21,7 @@ WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 
+# /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [
@@ -45,6 +46,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# /myid
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    await update.message.reply_text(
+        f"🆔 你的 Telegram ID：\n\n"
+        f"{user.id}"
+    )
+
+
+# 按鈕處理
 async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -60,14 +72,18 @@ async def button_handler(
         )
 
 
+# Telegram handlers
 telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("myid", myid))
 telegram_app.add_handler(CallbackQueryHandler(button_handler))
 
 
+# Render 首頁
 async def homepage(request: Request):
     return PlainTextResponse("77 VIP Bot is running!")
 
 
+# Telegram Webhook
 async def webhook(request: Request):
     data = await request.json()
 
@@ -81,6 +97,7 @@ async def webhook(request: Request):
     return PlainTextResponse("OK")
 
 
+# 啟動
 async def startup():
     await telegram_app.initialize()
 
@@ -89,6 +106,7 @@ async def startup():
     )
 
 
+# 關閉
 async def shutdown():
     await telegram_app.shutdown()
 
