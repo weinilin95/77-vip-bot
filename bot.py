@@ -1,4 +1,8 @@
 import os
+import asyncio
+import threading
+
+from flask import Flask, request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -9,6 +13,10 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PUBLIC_CHANNEL_URL = os.environ["PUBLIC_CHANNEL_URL"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+
+telegram_app = Application.builder().token(BOT_TOKEN).build()
+flask_app = Flask(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -34,14 +42,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "請等待管理員進行審核。"
         )
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CallbackQueryHandler(button_handler))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
+loop = asyncio.new_event_loop()
 
-    print("77 VIP Bot is running...")
-    app.run_polling()
+def run_loop():
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
-if __name__ == "__main__":
-    main()
+threading.Thread(target=run_loop, daemon=True).start()
+
+asyncio.run_coroutine_threadsafe(
+    telegram_app.initialize(), loop
+).result()
+
+asyncio.run_coroutine_threadsafe(
+    telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"), loop
+).result()
+
+@flask_app.route("/")
+def home():
+    return "77 VIP Bot is running!"
+
+@flask_app.route("/webhook", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+
+    future = asyncio.run_coroutine_threadsafe(
+        telegram_app.process_update(update), loop
+    )
+    future.result()
+
+    return "OK"
