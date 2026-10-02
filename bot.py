@@ -39,7 +39,7 @@ from sqlalchemy import (
     String,
     Text,
     select,
-    update,
+    update as sql_update,
 )
 from sqlalchemy.ext.asyncio import (
     AsyncAttrs,
@@ -320,7 +320,7 @@ async def expire_due_orders(user_id: Optional[int] = None):
     """
     async with SessionLocal() as session:
         stmt = (
-            update(Order)
+            sql_sql_update(Order)
             .where(
                 Order.status == "pending",
                 Order.expires_at < now_utc(),
@@ -526,7 +526,7 @@ async def notify_expired_orders():
 
         for order in expired_candidates:
             changed = await session.execute(
-                update(Order)
+                sql_sql_update(Order)
                 .where(
                     Order.order_id == order.order_id,
                     Order.status == "pending",
@@ -636,7 +636,7 @@ async def create_order_for_user(user) -> Order:
 
         # 舊的 pending 改為取消，避免同時有多筆待付款訂單。
         await session.execute(
-            update(Order)
+            sql_sql_update(Order)
             .where(
                 Order.user_id == user.id,
                 Order.status == "pending",
@@ -903,7 +903,7 @@ async def payment_done(
 
         # 原子狀態轉移：pending -> awaiting_review
         changed = await session.execute(
-            update(Order)
+            sql_sql_update(Order)
             .where(
                 Order.order_id == order_id,
                 Order.user_id == user.id,
@@ -1004,7 +1004,7 @@ async def payment_approve(
     # awaiting_review -> processing
     async with SessionLocal() as session:
         changed = await session.execute(
-            update(Order)
+            sql_sql_update(Order)
             .where(
                 Order.order_id == order_id,
                 Order.status == "awaiting_review",
@@ -1088,7 +1088,7 @@ async def payment_approve(
 
         async with SessionLocal() as session:
             await session.execute(
-                update(Order)
+                sql_sql_update(Order)
                 .where(
                     Order.order_id == order_id,
                     Order.status == "processing",
@@ -1113,7 +1113,7 @@ async def payment_approve(
         # 外部操作失敗就退回待審核，可重新按確認。
         async with SessionLocal() as session:
             await session.execute(
-                update(Order)
+                sql_sql_update(Order)
                 .where(
                     Order.order_id == order_id,
                     Order.status == "processing",
@@ -1166,7 +1166,7 @@ async def payment_reject(
             return
 
         changed = await session.execute(
-            update(Order)
+            sql_sql_update(Order)
             .where(
                 Order.order_id == order_id,
                 Order.status == "awaiting_review",
@@ -1224,7 +1224,7 @@ async def cancel_payment(
 
     async with SessionLocal() as session:
         changed = await session.execute(
-            update(Order)
+            sql_sql_update(Order)
             .where(
                 Order.order_id == order_id,
                 Order.user_id == user_id,
@@ -1331,7 +1331,7 @@ async def vip_member_update(
 
         async with SessionLocal() as session:
             await session.execute(
-                update(Order)
+                sql_sql_update(Order)
                 .where(
                     Order.order_id == order_id,
                     Order.user_id == user.id,
