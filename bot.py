@@ -104,26 +104,44 @@ def create_usdt_qr(address):
 # =========================================================
 
 async def get_usdt_twd_rate():
-    url = (
+    """
+    取得 1 USDT 約等於多少 TWD
+
+    優先：
+    1. CoinGecko USDT/TWD
+    2. Coinbase USDT/USD × Frankfurter USD/TWD
+
+    匯率僅供顯示，
+    實際付款固定 10 USDT。
+    """
+
+    timeout = httpx.Timeout(10.0)
+
+    # =====================================================
+    # 1. CoinGecko
+    # =====================================================
+
+    coingecko_url = (
         "https://api.coingecko.com/api/v3/simple/price"
     )
 
-    params = {
+    coingecko_params = {
         "ids": "tether",
         "vs_currencies": "twd"
     }
 
-    timeout = httpx.Timeout(10.0)
-
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             async with httpx.AsyncClient(
-                timeout=timeout
+                timeout=timeout,
+                headers={
+                    "User-Agent": "77VIPBot/1.0"
+                }
             ) as client:
 
                 response = await client.get(
-                    url,
-                    params=params
+                    coingecko_url,
+                    params=coingecko_params
                 )
 
                 response.raise_for_status()
@@ -137,20 +155,18 @@ async def get_usdt_twd_rate():
 
             if rate is None:
                 raise ValueError(
-                    "CoinGecko 未回傳 USDT/TWD"
+                    "CoinGecko 沒有回傳 TWD"
                 )
 
-            rate = Decimal(
-                str(rate)
-            )
+            rate = Decimal(str(rate))
 
             if rate <= 0:
                 raise ValueError(
-                    "USDT/TWD 匯率異常"
+                    "CoinGecko 匯率異常"
                 )
 
             print(
-                f"Rate source: CoinGecko | "
+                "Rate source: CoinGecko | "
                 f"1 USDT = {rate} TWD"
             )
 
@@ -161,6 +177,117 @@ async def get_usdt_twd_rate():
                 f"CoinGecko attempt "
                 f"{attempt + 1} failed: {e}"
             )
+
+
+    # =====================================================
+    # 2. 備援
+    # Coinbase USDT/USD
+    # ×
+    # Frankfurter USD/TWD
+    # =====================================================
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers={
+                "User-Agent": "77VIPBot/1.0"
+            }
+        ) as client:
+
+            # ---------------------------------------------
+            # USDT -> USD
+            # ---------------------------------------------
+
+            coinbase_response = await client.get(
+                "https://api.coinbase.com/v2/exchange-rates",
+                params={
+                    "currency": "USDT"
+                }
+            )
+
+            coinbase_response.raise_for_status()
+
+            coinbase_data = (
+                coinbase_response.json()
+            )
+
+            usdt_usd = Decimal(
+                str(
+                    coinbase_data[
+                        "data"
+                    ][
+                        "rates"
+                    ][
+                        "USD"
+                    ]
+                )
+            )
+
+
+            # ---------------------------------------------
+            # USD -> TWD
+            # ---------------------------------------------
+
+            fx_response = await client.get(
+                "https://api.frankfurter.app/latest",
+                params={
+                    "from": "USD",
+                    "to": "TWD"
+                }
+            )
+
+            fx_response.raise_for_status()
+
+            fx_data = (
+                fx_response.json()
+            )
+
+            usd_twd = Decimal(
+                str(
+                    fx_data[
+                        "rates"
+                    ][
+                        "TWD"
+                    ]
+                )
+            )
+
+
+        # ---------------------------------------------
+        # USDT/TWD
+        # ---------------------------------------------
+
+        rate = (
+            usdt_usd
+            * usd_twd
+        ).quantize(
+            Decimal("0.01")
+        )
+
+        if rate <= 0:
+            raise ValueError(
+                "備援匯率異常"
+            )
+
+        print(
+            "Rate source: Backup | "
+            f"USDT/USD={usdt_usd} | "
+            f"USD/TWD={usd_twd} | "
+            f"1 USDT={rate} TWD"
+        )
+
+        return rate
+
+
+    except Exception as e:
+        print(
+            f"Backup rate failed: {e}"
+        )
+
+
+    # =====================================================
+    # 所有來源都失敗
+    # =====================================================
 
     return None
 
