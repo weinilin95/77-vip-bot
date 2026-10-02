@@ -5,6 +5,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
 )
@@ -86,7 +87,6 @@ async def apply_vip(query, context):
             return
 
     except Exception:
-        # 非會員時 Telegram 可能回傳例外，繼續申請流程
         pass
 
     username = (
@@ -108,7 +108,6 @@ async def apply_vip(query, context):
         ]
     ])
 
-    # 傳送申請給管理員
     await context.bot.send_message(
         chat_id=ADMIN_ID,
         text=(
@@ -132,23 +131,20 @@ async def apply_vip(query, context):
 # 管理員批准
 # =========================
 async def approve_vip(query, context, user_id):
-    # 防止其他人偽造 callback
     if query.from_user.id != ADMIN_ID:
-        await query.answer(
-            "你沒有管理員權限。",
-            show_alert=True
-        )
         return
 
     try:
-        # 邀請連結 30 分鐘後失效
-        expire_time = datetime.now(timezone.utc) + timedelta(minutes=30)
+        expire_time = (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=30)
+        )
 
         invite = await context.bot.create_chat_invite_link(
-    chat_id=VIP_CHANNEL_ID,
-    expire_date=expire_time,
-    name=f"VIP-{user_id}"
-)
+            chat_id=VIP_CHANNEL_ID,
+            expire_date=expire_time,
+            name=f"VIP-{user_id}"
+        )
 
         keyboard = InlineKeyboardMarkup([
             [
@@ -164,7 +160,8 @@ async def approve_vip(query, context, user_id):
             text=(
                 "🎉 你的 VIP 申請已通過！\n\n"
                 "下方是你的專屬加入連結 🔐\n\n"
-"⚠️ 此專屬連結將於 30 分鐘後失效。"
+                "⚠️ 此專屬連結將於 30 分鐘後失效。\n"
+                "成功加入後，此邀請連結會立即失效。"
             ),
             reply_markup=keyboard
         )
@@ -179,9 +176,9 @@ async def approve_vip(query, context, user_id):
     except Exception as e:
         print(f"Approve error: {e}")
 
-        await query.answer(
-            "建立 VIP 邀請連結失敗，請查看 Render Logs。",
-            show_alert=True
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"❌ 建立 VIP 邀請連結失敗：\n{e}"
         )
 
 
@@ -190,10 +187,6 @@ async def approve_vip(query, context, user_id):
 # =========================
 async def reject_vip(query, context, user_id):
     if query.from_user.id != ADMIN_ID:
-        await query.answer(
-            "你沒有管理員權限。",
-            show_alert=True
-        )
         return
 
     try:
@@ -214,14 +207,112 @@ async def reject_vip(query, context, user_id):
     except Exception as e:
         print(f"Reject error: {e}")
 
-        await query.answer(
-            "處理失敗，請查看 Render Logs。",
-            show_alert=True
+
+# =========================
+# VIP 加入成功
+# 自動撤銷專屬邀請連結
+# =========================
+async def vip_member_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    chat_member_update = update.chat_member
+
+    if not chat_member_update:
+        return
+
+    # 只處理 77VIP 頻道
+    if chat_member_update.chat.id != VIP_CHANNEL_ID:
+        return
+
+    new_member = chat_member_update.new_chat_member
+
+    # 確認會員真的已經加入
+    if new_member.status not in [
+        "member",
+        "administrator",
+        "creator"
+    ]:
+        return
+
+    user = new_member.user
+
+    # Telegram 會告訴 Bot 這次加入使用的是哪條邀請連結
+    invite_link = chat_member_update.invite_link
+
+    if not invite_link:
+        return
+
+    # 只處理由我們 Bot 建立的 VIP 專屬連結
+    expected_name = f"VIP-{user.id}"
+
+    if invite_link.name != expected_name:
+        return
+
+    try:
+        # 成功加入後立即撤銷連結
+        await context.bot.revoke_chat_invite_link(
+            chat_id=VIP_CHANNEL_ID,
+            invite_link=invite_link.invite_link
         )
+
+        print(
+            f"VIP joined: {user.id} "
+            f"- invite link revoked"
+        )
+
+        # 通知會員
+        try:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    "✅ 已成功加入 77VIP！\n\n"
+                    "🔐 你的專屬邀請連結已自動失效。"
+                )
+            )
+        except Exception as e:
+            print(f"Member notification error: {e}")
+
+        # 通知管理員
+        try:
+            username = (
+                f"@{user.username}"
+                if user.username
+                else "未設定"
+            )
+
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "✅ VIP 會員已成功加入\n\n"
+                    f"👤 名稱：{user.full_name}\n"
+                    f"🔗 Username：{username}\n"
+                    f"🆔 User ID：{user.id}\n\n"
+                    "🔒 專屬邀請連結已自動撤銷。"
+                )
+            )
+
+        except Exception as e:
+            print(f"Admin notification error: {e}")
+
+    except Exception as e:
+        print(f"Revoke invite error: {e}")
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "⚠️ 會員已加入，但邀請連結自動撤銷失敗。\n\n"
+                    f"User ID：{user.id}\n"
+                    f"錯誤：{e}"
+                )
+            )
+        except Exception:
+            pass
 
 
 # =========================
-# 所有 Inline Button
+# Inline Button
 # =========================
 async def button_handler(
     update: Update,
@@ -238,6 +329,7 @@ async def button_handler(
 
     if data.startswith("approve:"):
         user_id = int(data.split(":")[1])
+
         await approve_vip(
             query,
             context,
@@ -247,11 +339,13 @@ async def button_handler(
 
     if data.startswith("reject:"):
         user_id = int(data.split(":")[1])
+
         await reject_vip(
             query,
             context,
             user_id
         )
+        return
 
 
 # =========================
@@ -269,13 +363,21 @@ telegram_app.add_handler(
     CallbackQueryHandler(button_handler)
 )
 
+# 偵測會員加入/退出 VIP
+telegram_app.add_handler(
+    ChatMemberHandler(
+        vip_member_update,
+        ChatMemberHandler.CHAT_MEMBER
+    )
+)
+
 
 # =========================
 # Render 首頁
 # =========================
 async def homepage(request: Request):
     return PlainTextResponse(
-        "77 VIP Bot V2 is running!"
+        "77 VIP Bot V2.1 is running!"
     )
 
 
@@ -306,6 +408,7 @@ async def startup():
         allowed_updates=[
             "message",
             "callback_query",
+            "chat_member",
         ]
     )
 
