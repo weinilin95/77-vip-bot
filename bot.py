@@ -53,21 +53,20 @@ telegram_app = (
 
 
 # =========================================================
-# 工具：訂單編號
+# 工具：產生訂單編號
 # =========================================================
 
 def create_order_id():
     now = datetime.now(timezone.utc)
 
     date_text = now.strftime("%Y%m%d")
-
     random_text = secrets.token_hex(3).upper()
 
     return f"VIP{date_text}{random_text}"
 
 
 # =========================================================
-# 工具：USDT QR Code
+# 工具：產生 TRC20 QR Code
 # =========================================================
 
 def create_usdt_qr(address):
@@ -99,197 +98,135 @@ def create_usdt_qr(address):
 
 
 # =========================================================
-# 工具：取得 USDT/TWD 即時匯率
-# CoinGecko，自動重試 3 次
+# CoinMarketCap：
+# 取得 USDT / TWD 即時價格
+# 不需要 API Key
 # =========================================================
 
 async def get_usdt_twd_rate():
     """
-    取得 1 USDT 約等於多少 TWD
+    CoinMarketCap Keyless Public API
 
-    優先：
-    1. CoinGecko USDT/TWD
-    2. Coinbase USDT/USD × Frankfurter USD/TWD
+    GET:
+    /public-api/v2/simple/price
 
-    匯率僅供顯示，
-    實際付款固定 10 USDT。
+    symbol=USDT
+    convert=TWD
+
+    實際付款仍固定 10 USDT。
+    匯率只用來顯示台幣參考值。
     """
 
-    timeout = httpx.Timeout(10.0)
-
-    # =====================================================
-    # 1. CoinGecko
-    # =====================================================
-
-    coingecko_url = (
-        "https://api.coingecko.com/api/v3/simple/price"
+    url = (
+        "https://pro-api.coinmarketcap.com"
+        "/public-api/v2/simple/price"
     )
 
-    coingecko_params = {
-        "ids": "tether",
-        "vs_currencies": "twd"
+    params = {
+        "symbol": "USDT",
+        "convert": "TWD",
+        "precision": 4,
     }
 
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                headers={
-                    "User-Agent": "77VIPBot/1.0"
-                }
-            ) as client:
-
-                response = await client.get(
-                    coingecko_url,
-                    params=coingecko_params
-                )
-
-                response.raise_for_status()
-
-                data = response.json()
-
-            rate = (
-                data.get("tether", {})
-                .get("twd")
-            )
-
-            if rate is None:
-                raise ValueError(
-                    "CoinGecko 沒有回傳 TWD"
-                )
-
-            rate = Decimal(str(rate))
-
-            if rate <= 0:
-                raise ValueError(
-                    "CoinGecko 匯率異常"
-                )
-
-            print(
-                "Rate source: CoinGecko | "
-                f"1 USDT = {rate} TWD"
-            )
-
-            return rate
-
-        except Exception as e:
-            print(
-                f"CoinGecko attempt "
-                f"{attempt + 1} failed: {e}"
-            )
-
-
-    # =====================================================
-    # 2. 備援
-    # Coinbase USDT/USD
-    # ×
-    # Frankfurter USD/TWD
-    # =====================================================
+    timeout = httpx.Timeout(10.0)
 
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
+            follow_redirects=True,
             headers={
+                "Accept": "application/json",
                 "User-Agent": "77VIPBot/1.0"
             }
         ) as client:
 
-            # ---------------------------------------------
-            # USDT -> USD
-            # ---------------------------------------------
-
-            coinbase_response = await client.get(
-                "https://api.coinbase.com/v2/exchange-rates",
-                params={
-                    "currency": "USDT"
-                }
+            response = await client.get(
+                url,
+                params=params
             )
 
-            coinbase_response.raise_for_status()
+            response.raise_for_status()
 
-            coinbase_data = (
-                coinbase_response.json()
+            data = response.json()
+
+        # CoinMarketCap Simple Price 回傳格式：
+        #
+        # {
+        #   "data": [
+        #     {
+        #       "symbol": "USDT",
+        #       "quotes": [
+        #         {
+        #           "symbol": "TWD",
+        #           "price": 31.88
+        #         }
+        #       ]
+        #     }
+        #   ]
+        # }
+
+        assets = data.get("data", [])
+
+        if not assets:
+            raise ValueError(
+                "CoinMarketCap 沒有回傳 USDT 資料"
             )
 
-            usdt_usd = Decimal(
-                str(
-                    coinbase_data[
-                        "data"
-                    ][
-                        "rates"
-                    ][
-                        "USD"
-                    ]
-                )
+        usdt_data = assets[0]
+
+        quotes = usdt_data.get(
+            "quotes",
+            []
+        )
+
+        if not quotes:
+            raise ValueError(
+                "CoinMarketCap 沒有回傳 TWD 報價"
             )
 
+        twd_quote = None
 
-            # ---------------------------------------------
-            # USD -> TWD
-            # ---------------------------------------------
+        for quote in quotes:
+            if quote.get("symbol") == "TWD":
+                twd_quote = quote
+                break
 
-            fx_response = await client.get(
-                "https://api.frankfurter.app/latest",
-                params={
-                    "from": "USD",
-                    "to": "TWD"
-                }
+        if twd_quote is None:
+            raise ValueError(
+                "找不到 TWD quote"
             )
 
-            fx_response.raise_for_status()
+        raw_price = twd_quote.get(
+            "price"
+        )
 
-            fx_data = (
-                fx_response.json()
+        if raw_price is None:
+            raise ValueError(
+                "CoinMarketCap 沒有回傳 price"
             )
 
-            usd_twd = Decimal(
-                str(
-                    fx_data[
-                        "rates"
-                    ][
-                        "TWD"
-                    ]
-                )
-            )
-
-
-        # ---------------------------------------------
-        # USDT/TWD
-        # ---------------------------------------------
-
-        rate = (
-            usdt_usd
-            * usd_twd
-        ).quantize(
-            Decimal("0.01")
+        rate = Decimal(
+            str(raw_price)
         )
 
         if rate <= 0:
             raise ValueError(
-                "備援匯率異常"
+                "USDT/TWD 匯率異常"
             )
 
         print(
-            "Rate source: Backup | "
-            f"USDT/USD={usdt_usd} | "
-            f"USD/TWD={usd_twd} | "
-            f"1 USDT={rate} TWD"
+            "Rate source: CoinMarketCap | "
+            f"1 USDT = {rate} TWD"
         )
 
         return rate
 
-
     except Exception as e:
         print(
-            f"Backup rate failed: {e}"
+            f"CoinMarketCap rate error: {e}"
         )
 
-
-    # =====================================================
-    # 所有來源都失敗
-    # =====================================================
-
-    return None
+        return None
 
 
 # =========================================================
@@ -377,7 +314,7 @@ async def buy_vip(
     except Exception:
         pass
 
-    # 只有 USDT，所以直接建立付款訂單
+    # 只有 USDT
     await pay_usdt(
         query,
         context
@@ -396,19 +333,26 @@ async def pay_usdt(
 
     try:
         await query.edit_message_text(
-            "⏳ 正在取得 USDT / TWD 即時匯率..."
+            "⏳ 正在取得 USDT / TWD 即時價格..."
         )
 
     except Exception:
         pass
 
-    # 固定收 10 USDT
+    # -----------------------------------------------------
+    # 實際付款固定 10 USDT
+    # -----------------------------------------------------
+
     usdt_amount = VIP_PRICE_USDT
 
-    # 匯率只供顯示
+    # -----------------------------------------------------
+    # 查 CoinMarketCap
+    # -----------------------------------------------------
+
     rate = await get_usdt_twd_rate()
 
     if rate is not None:
+
         twd_value = (
             usdt_amount
             * rate
@@ -417,7 +361,12 @@ async def pay_usdt(
         )
 
     else:
+
         twd_value = None
+
+    # -----------------------------------------------------
+    # 訂單
+    # -----------------------------------------------------
 
     order_id = create_order_id()
 
@@ -426,24 +375,33 @@ async def pay_usdt(
         + timedelta(minutes=30)
     )
 
-    # 暫存訂單
     context.user_data["payment"] = {
         "order_id": order_id,
-        "amount": str(usdt_amount),
+
+        "amount": str(
+            usdt_amount
+        ),
+
         "rate": (
             str(rate)
             if rate is not None
             else "N/A"
         ),
+
         "twd_value": (
             str(twd_value)
             if twd_value is not None
             else "N/A"
         ),
+
         "expire_timestamp": (
             expire_time.timestamp()
         )
     }
+
+    # -----------------------------------------------------
+    # QR
+    # -----------------------------------------------------
 
     qr_image = create_usdt_qr(
         USDT_TRC20_ADDRESS
@@ -470,24 +428,37 @@ async def pay_usdt(
         ]
     ])
 
+    # -----------------------------------------------------
+    # 匯率顯示
+    # -----------------------------------------------------
+
     if rate is not None:
+
         rate_text = (
             f"💱 即時匯率："
             f"1 USDT ≈ NT${rate}\n"
-            f"🇹🇼 約等值："
+
+            f"🇹🇼 10 USDT 約等值："
             f"NT${twd_value}\n"
+
+            "📊 匯率來源：CoinMarketCap\n"
         )
 
     else:
+
         rate_text = (
-            "💱 即時匯率："
-            "暫時無法取得\n"
+            "💱 即時匯率：暫時無法取得\n"
         )
+
+    # -----------------------------------------------------
+    # 訂單訊息
+    # -----------------------------------------------------
 
     text = (
         "💵 USDT 付款\n\n"
 
-        f"📄 訂單號：{order_id}\n"
+        f"📄 訂單號："
+        f"{order_id}\n"
 
         f"💰 支付金額："
         f"{usdt_amount} USDT\n"
@@ -495,6 +466,7 @@ async def pay_usdt(
         f"{rate_text}\n"
 
         "📥 收款地址（TRC20）：\n"
+
         f"{USDT_TRC20_ADDRESS}\n\n"
 
         "━━━━━━━━━━━━━━\n"
@@ -526,7 +498,7 @@ async def pay_usdt(
 
 
 # =========================================================
-# 使用者按「我已支付」
+# 使用者按：我已支付
 # =========================================================
 
 async def payment_done(
@@ -550,11 +522,18 @@ async def payment_done(
 
         return
 
-    now = datetime.now(
-        timezone.utc
-    ).timestamp()
+    now = (
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
 
-    if now > payment["expire_timestamp"]:
+    if (
+        now
+        > payment[
+            "expire_timestamp"
+        ]
+    ):
 
         await query.answer(
             "此訂單已超過 30 分鐘，"
@@ -564,10 +543,21 @@ async def payment_done(
 
         return
 
-    order_id = payment["order_id"]
-    amount = payment["amount"]
-    rate = payment["rate"]
-    twd_value = payment["twd_value"]
+    order_id = (
+        payment["order_id"]
+    )
+
+    amount = (
+        payment["amount"]
+    )
+
+    rate = (
+        payment["rate"]
+    )
+
+    twd_value = (
+        payment["twd_value"]
+    )
 
     username = (
         f"@{user.username}"
@@ -601,19 +591,23 @@ async def payment_done(
     admin_text = (
         "💰 新的 VIP 付款確認\n\n"
 
-        f"📄 訂單：{order_id}\n"
+        f"📄 訂單："
+        f"{order_id}\n"
 
         f"💵 應付金額："
         f"{amount} USDT\n"
     )
 
     if rate != "N/A":
+
         admin_text += (
             f"💱 建單匯率："
             f"1 USDT ≈ NT${rate}\n"
 
             f"🇹🇼 約等值："
             f"NT${twd_value}\n"
+
+            "📊 來源：CoinMarketCap\n"
         )
 
     admin_text += (
@@ -669,7 +663,10 @@ async def payment_approve(
     user_id,
     order_id
 ):
-    if query.from_user.id != ADMIN_ID:
+    if (
+        query.from_user.id
+        != ADMIN_ID
+    ):
 
         await query.answer(
             "你沒有管理員權限。",
@@ -680,8 +677,10 @@ async def payment_approve(
 
     try:
 
-        # 曾被移除 / 封鎖
-        # 批准前自動解除
+        # -------------------------------------------------
+        # 曾被移除的會員先解除
+        # -------------------------------------------------
+
         try:
 
             await context.bot.unban_chat_member(
@@ -696,10 +695,17 @@ async def payment_approve(
                 f"Unban error: {e}"
             )
 
-        # VIP 邀請 30 分鐘有效
+        # -------------------------------------------------
+        # 建立 VIP 邀請
+        # -------------------------------------------------
+
         expire_time = (
-            datetime.now(timezone.utc)
-            + timedelta(minutes=30)
+            datetime.now(
+                timezone.utc
+            )
+            + timedelta(
+                minutes=30
+            )
         )
 
         invite = (
@@ -715,10 +721,16 @@ async def payment_approve(
             [
                 InlineKeyboardButton(
                     "🔐 進入 77VIP",
-                    url=invite.invite_link
+                    url=(
+                        invite.invite_link
+                    )
                 )
             ]
         ])
+
+        # -------------------------------------------------
+        # 通知會員
+        # -------------------------------------------------
 
         await context.bot.send_message(
             chat_id=user_id,
@@ -781,7 +793,10 @@ async def payment_reject(
     user_id,
     order_id
 ):
-    if query.from_user.id != ADMIN_ID:
+    if (
+        query.from_user.id
+        != ADMIN_ID
+    ):
 
         await query.answer(
             "你沒有管理員權限。",
@@ -830,7 +845,7 @@ async def payment_reject(
 
 
 # =========================================================
-# 取消訂單
+# 取消付款
 # =========================================================
 
 async def cancel_payment(
@@ -881,16 +896,22 @@ async def vip_member_update(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    member_update = update.chat_member
+    member_update = (
+        update.chat_member
+    )
 
     if not member_update:
         return
 
-    if member_update.chat.id != VIP_CHANNEL_ID:
+    if (
+        member_update.chat.id
+        != VIP_CHANNEL_ID
+    ):
         return
 
     new_member = (
-        member_update.new_chat_member
+        member_update
+        .new_chat_member
     )
 
     if new_member.status not in [
@@ -900,7 +921,9 @@ async def vip_member_update(
     ]:
         return
 
-    user = new_member.user
+    user = (
+        new_member.user
+    )
 
     invite_link = (
         member_update.invite_link
@@ -913,7 +936,10 @@ async def vip_member_update(
         f"VIP-{user.id}"
     )
 
-    if invite_link.name != expected_name:
+    if (
+        invite_link.name
+        != expected_name
+    ):
         return
 
     try:
@@ -1023,7 +1049,9 @@ async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    query = update.callback_query
+    query = (
+        update.callback_query
+    )
 
     await query.answer()
 
@@ -1069,8 +1097,13 @@ async def button_handler(
 
         parts = data.split(":")
 
-        user_id = int(parts[1])
-        order_id = parts[2]
+        user_id = int(
+            parts[1]
+        )
+
+        order_id = (
+            parts[2]
+        )
 
         await payment_approve(
             query,
@@ -1085,8 +1118,13 @@ async def button_handler(
 
         parts = data.split(":")
 
-        user_id = int(parts[1])
-        order_id = parts[2]
+        user_id = int(
+            parts[1]
+        )
+
+        order_id = (
+            parts[2]
+        )
 
         await payment_reject(
             query,
@@ -1099,7 +1137,7 @@ async def button_handler(
 
 
 # =========================================================
-# Telegram Handlers
+# Telegram handlers
 # =========================================================
 
 telegram_app.add_handler(
@@ -1138,7 +1176,7 @@ async def homepage(
     request: Request
 ):
     return PlainTextResponse(
-        "77 VIP Bot FINAL is running!"
+        "77 VIP Bot CMC FINAL is running!"
     )
 
 
@@ -1149,7 +1187,9 @@ async def homepage(
 async def webhook(
     request: Request
 ):
-    data = await request.json()
+    data = (
+        await request.json()
+    )
 
     update = Update.de_json(
         data=data,
@@ -1193,7 +1233,7 @@ async def shutdown():
 
 
 # =========================================================
-# Starlette App
+# Starlette
 # =========================================================
 
 app = Starlette(
