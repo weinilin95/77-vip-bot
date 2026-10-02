@@ -145,11 +145,10 @@ async def approve_vip(query, context, user_id):
         expire_time = datetime.now(timezone.utc) + timedelta(minutes=30)
 
         invite = await context.bot.create_chat_invite_link(
-            chat_id=VIP_CHANNEL_ID,
-            member_limit=1,
-            expire_date=expire_time,
-            name=f"VIP-{user_id}"
-        )
+    chat_id=VIP_CHANNEL_ID,
+    expire_date=expire_time,
+    name=f"VIP-{user_id}"
+)
 
         keyboard = InlineKeyboardMarkup([
             [
@@ -165,8 +164,7 @@ async def approve_vip(query, context, user_id):
             text=(
                 "🎉 你的 VIP 申請已通過！\n\n"
                 "下方是你的專屬加入連結 🔐\n\n"
-                "⚠️ 此連結僅限 1 人使用，"
-                "並於 30 分鐘後失效。"
+                "⚠️ 此專屬連結將於 30 分鐘後失效。"
             ),
             reply_markup=keyboard
         )
