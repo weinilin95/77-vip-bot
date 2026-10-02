@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -6,8 +7,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -19,12 +18,14 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 PUBLIC_CHANNEL_URL = os.environ["PUBLIC_CHANNEL_URL"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-
+VIP_CHANNEL_ID = int(os.environ["VIP_CHANNEL_ID"])
 
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 
+# =========================
 # /start
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [
@@ -49,7 +50,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# =========================
 # /myid
+# =========================
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
@@ -58,30 +61,170 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# 偵測頻道貼文，將 Channel ID 私訊給管理員
-async def channel_post_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    channel_post = update.channel_post
+# =========================
+# VIP 申請
+# =========================
+async def apply_vip(query, context):
+    user = query.from_user
 
-    if not channel_post:
-        return
+    # 先檢查是否已經是 VIP
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=VIP_CHANNEL_ID,
+            user_id=user.id
+        )
 
-    chat = channel_post.chat
+        if member.status in [
+            "member",
+            "administrator",
+            "creator"
+        ]:
+            await query.edit_message_text(
+                "✨ 你已經是 77VIP 會員囉！\n\n"
+                "不需要再次申請 🔐"
+            )
+            return
 
+    except Exception:
+        # 非會員時 Telegram 可能回傳例外，繼續申請流程
+        pass
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "未設定"
+    )
+
+    admin_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ 批准",
+                callback_data=f"approve:{user.id}"
+            ),
+            InlineKeyboardButton(
+                "❌ 拒絕",
+                callback_data=f"reject:{user.id}"
+            )
+        ]
+    ])
+
+    # 傳送申請給管理員
     await context.bot.send_message(
         chat_id=ADMIN_ID,
         text=(
-            "📡 偵測到頻道\n\n"
-            f"名稱：{chat.title}\n"
-            f"Channel ID：\n`{chat.id}`"
+            "🔥 新的 VIP 加入申請\n\n"
+            f"👤 名稱：{user.full_name}\n"
+            f"🔗 Username：{username}\n"
+            f"🆔 User ID：{user.id}\n\n"
+            "請選擇是否批准："
         ),
-        parse_mode="Markdown"
+        reply_markup=admin_keyboard
+    )
+
+    await query.edit_message_text(
+        "✅ VIP 申請已送出\n\n"
+        "管理員收到你的申請了。\n"
+        "審核完成後，Bot 會直接通知你 🔔"
     )
 
 
-# 按鈕
+# =========================
+# 管理員批准
+# =========================
+async def approve_vip(query, context, user_id):
+    # 防止其他人偽造 callback
+    if query.from_user.id != ADMIN_ID:
+        await query.answer(
+            "你沒有管理員權限。",
+            show_alert=True
+        )
+        return
+
+    try:
+        # 邀請連結 30 分鐘後失效
+        expire_time = datetime.now(timezone.utc) + timedelta(minutes=30)
+
+        invite = await context.bot.create_chat_invite_link(
+            chat_id=VIP_CHANNEL_ID,
+            member_limit=1,
+            expire_date=expire_time,
+            name=f"VIP-{user_id}"
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔐 進入 77VIP",
+                    url=invite.invite_link
+                )
+            ]
+        ])
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎉 你的 VIP 申請已通過！\n\n"
+                "下方是你的專屬加入連結 🔐\n\n"
+                "⚠️ 此連結僅限 1 人使用，"
+                "並於 30 分鐘後失效。"
+            ),
+            reply_markup=keyboard
+        )
+
+        await query.edit_message_text(
+            query.message.text
+            + "\n\n"
+            + "✅ 已批准\n"
+            + "專屬邀請連結已傳送給會員。"
+        )
+
+    except Exception as e:
+        print(f"Approve error: {e}")
+
+        await query.answer(
+            "建立 VIP 邀請連結失敗，請查看 Render Logs。",
+            show_alert=True
+        )
+
+
+# =========================
+# 管理員拒絕
+# =========================
+async def reject_vip(query, context, user_id):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer(
+            "你沒有管理員權限。",
+            show_alert=True
+        )
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "❌ 你的 VIP 申請目前未通過。\n\n"
+                "如有疑問，請聯絡管理員。"
+            )
+        )
+
+        await query.edit_message_text(
+            query.message.text
+            + "\n\n"
+            + "❌ 已拒絕"
+        )
+
+    except Exception as e:
+        print(f"Reject error: {e}")
+
+        await query.answer(
+            "處理失敗，請查看 Render Logs。",
+            show_alert=True
+        )
+
+
+# =========================
+# 所有 Inline Button
+# =========================
 async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -89,22 +232,39 @@ async def button_handler(
     query = update.callback_query
     await query.answer()
 
-    if query.data == "apply_vip":
-        await query.edit_message_text(
-            "🔐 VIP 加入申請\n\n"
-            "你的申請流程已開始。\n"
-            "請等待管理員進行審核。"
+    data = query.data
+
+    if data == "apply_vip":
+        await apply_vip(query, context)
+        return
+
+    if data.startswith("approve:"):
+        user_id = int(data.split(":")[1])
+        await approve_vip(
+            query,
+            context,
+            user_id
+        )
+        return
+
+    if data.startswith("reject:"):
+        user_id = int(data.split(":")[1])
+        await reject_vip(
+            query,
+            context,
+            user_id
         )
 
 
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("myid", myid))
+# =========================
+# Telegram handlers
+# =========================
+telegram_app.add_handler(
+    CommandHandler("start", start)
+)
 
 telegram_app.add_handler(
-    MessageHandler(
-        filters.UpdateType.CHANNEL_POST,
-        channel_post_handler
-    )
+    CommandHandler("myid", myid)
 )
 
 telegram_app.add_handler(
@@ -112,10 +272,18 @@ telegram_app.add_handler(
 )
 
 
+# =========================
+# Render 首頁
+# =========================
 async def homepage(request: Request):
-    return PlainTextResponse("77 VIP Bot is running!")
+    return PlainTextResponse(
+        "77 VIP Bot V2 is running!"
+    )
 
 
+# =========================
+# Telegram Webhook
+# =========================
 async def webhook(request: Request):
     data = await request.json()
 
@@ -129,6 +297,9 @@ async def webhook(request: Request):
     return PlainTextResponse("OK")
 
 
+# =========================
+# 啟動
+# =========================
 async def startup():
     await telegram_app.initialize()
 
@@ -137,19 +308,29 @@ async def startup():
         allowed_updates=[
             "message",
             "callback_query",
-            "channel_post",
         ]
     )
 
 
+# =========================
+# 關閉
+# =========================
 async def shutdown():
     await telegram_app.shutdown()
 
 
 app = Starlette(
     routes=[
-        Route("/", homepage, methods=["GET", "HEAD"]),
-        Route("/webhook", webhook, methods=["POST"]),
+        Route(
+            "/",
+            homepage,
+            methods=["GET", "HEAD"]
+        ),
+        Route(
+            "/webhook",
+            webhook,
+            methods=["POST"]
+        ),
     ],
     on_startup=[startup],
     on_shutdown=[shutdown],
