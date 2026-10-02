@@ -2,6 +2,7 @@ import os
 import io
 import secrets
 import asyncio
+from pathlib import Path
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -227,6 +228,14 @@ def status_label(status: str) -> str:
     return STATUS_LABELS.get(status, status)
 
 
+def format_usdt_amount(value) -> str:
+    """顯示 USDT 時移除資料庫 Numeric 欄位補出的尾端 0。"""
+    text = format(Decimal(value), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -382,71 +391,107 @@ async def get_active_order(user_id: int) -> Optional[Order]:
 # COINMARKETCAP USDT/TWD
 # =========================================================
 
+# 匯率快取：避免每張訂單都呼叫 CoinMarketCap 而觸發 429。
+RATE_CACHE_TTL_SECONDS = 300  # 5 分鐘
+_usdt_twd_rate_cache: Optional[Decimal] = None
+_usdt_twd_rate_cache_until: Optional[datetime] = None
+_usdt_twd_rate_lock = asyncio.Lock()
+
 async def get_usdt_twd_rate() -> Optional[Decimal]:
     """
     匯率只作畫面參考；付款金額固定 VIP_PRICE_USDT。
+    5 分鐘內共用同一筆匯率，降低 API 429 機率。
     """
-    url = (
-        "https://pro-api.coinmarketcap.com"
-        "/public-api/v2/simple/price"
-    )
+    global _usdt_twd_rate_cache
+    global _usdt_twd_rate_cache_until
 
-    params = {
-        "symbol": "USDT",
-        "convert": "TWD",
-        "precision": 4,
-    }
+    now = now_utc()
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0),
-            follow_redirects=True,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "77VIPBot/1.0",
-            },
-        ) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
+    if (
+        _usdt_twd_rate_cache is not None
+        and _usdt_twd_rate_cache_until is not None
+        and now < _usdt_twd_rate_cache_until
+    ):
+        return _usdt_twd_rate_cache
 
-        assets = data.get("data", [])
-        if not assets:
-            raise ValueError("CoinMarketCap 沒有回傳 USDT 資料")
+    async with _usdt_twd_rate_lock:
+        # 可能已有另一個請求在等待 lock 期間更新了快取。
+        now = now_utc()
+        if (
+            _usdt_twd_rate_cache is not None
+            and _usdt_twd_rate_cache_until is not None
+            and now < _usdt_twd_rate_cache_until
+        ):
+            return _usdt_twd_rate_cache
 
-        # 容錯：data 可能為 list；quotes 可能為 list 或 dict。
-        usdt_data = assets[0] if isinstance(assets, list) else assets
+        url = (
+            "https://pro-api.coinmarketcap.com"
+            "/public-api/v2/simple/price"
+        )
 
-        quotes = usdt_data.get("quotes", [])
+        params = {
+            "symbol": "USDT",
+            "convert": "TWD",
+            "precision": 4,
+        }
 
-        raw_price = None
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0),
+                follow_redirects=True,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "77VIPBot/1.0",
+                },
+            ) as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
 
-        if isinstance(quotes, list):
-            for quote in quotes:
-                if quote.get("symbol") == "TWD":
-                    raw_price = quote.get("price")
-                    break
+            assets = data.get("data", [])
+            if not assets:
+                raise ValueError("CoinMarketCap 沒有回傳 USDT 資料")
 
-        elif isinstance(quotes, dict):
-            twd_quote = quotes.get("TWD", {})
-            if isinstance(twd_quote, dict):
-                raw_price = twd_quote.get("price")
-            elif twd_quote is not None:
-                raw_price = twd_quote
+            usdt_data = (
+                assets[0] if isinstance(assets, list) else assets
+            )
+            quotes = usdt_data.get("quotes", [])
+            raw_price = None
 
-        if raw_price is None:
-            raise ValueError("CoinMarketCap 沒有回傳 TWD price")
+            if isinstance(quotes, list):
+                for quote in quotes:
+                    if quote.get("symbol") == "TWD":
+                        raw_price = quote.get("price")
+                        break
 
-        rate = Decimal(str(raw_price))
-        if rate <= 0:
-            raise ValueError("USDT/TWD 匯率異常")
+            elif isinstance(quotes, dict):
+                twd_quote = quotes.get("TWD", {})
+                if isinstance(twd_quote, dict):
+                    raw_price = twd_quote.get("price")
+                elif twd_quote is not None:
+                    raw_price = twd_quote
 
-        print(f"Rate source: CoinMarketCap | 1 USDT = {rate} TWD")
-        return rate
+            if raw_price is None:
+                raise ValueError("CoinMarketCap 沒有回傳 TWD price")
 
-    except Exception as e:
-        print(f"CoinMarketCap rate error: {e}")
-        return None
+            rate = Decimal(str(raw_price))
+            if rate <= 0:
+                raise ValueError("USDT/TWD 匯率異常")
+
+            _usdt_twd_rate_cache = rate
+            _usdt_twd_rate_cache_until = (
+                now_utc() + timedelta(seconds=RATE_CACHE_TTL_SECONDS)
+            )
+
+            print(
+                "Rate source: CoinMarketCap | "
+                f"1 USDT = {rate} TWD | cached 5 min"
+            )
+            return rate
+
+        except Exception as e:
+            print(f"CoinMarketCap rate error: {e}")
+            return None
 
 
 
@@ -629,17 +674,15 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    # 先啟用固定底部功能選單
     await update.message.reply_text(
-        "✨ 歡迎來到 77VIP\n\n"
-        "🔐 77VIP 專屬入口\n\n"
-        f"🔥 永久 VIP｜{VIP_PRICE_USDT} USDT\n\n"
-        "💵 USDT（TRC20）付款",
+        "✨ 歡迎來到 77VIP",
         reply_markup=main_reply_keyboard(),
     )
 
-    await update.message.reply_text(
-        "請選擇下方功能 👇",
-        reply_markup=home_inline_keyboard(),
+    await send_home_content(
+        chat_id=update.effective_chat.id,
+        context=context,
     )
 
 
@@ -762,22 +805,37 @@ async def pay_usdt(query, context):
     else:
         rate_text = "💱 即時匯率：暫時無法取得\n"
 
+    expire_text = order.expires_at.astimezone(
+        TAIWAN_TZ
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+    amount_text = format_usdt_amount(
+        order.amount_usdt
+    )
+
     text = (
         "💵 USDT 付款\n\n"
         f"📄 訂單號：{order.order_id}\n"
-        f"💰 支付金額：{Decimal(order.amount_usdt):g} USDT\n"
+        f"💰 支付金額：{amount_text} USDT\n"
         f"{rate_text}\n"
         "📥 收款地址（TRC20）：\n"
         f"{USDT_TRC20_ADDRESS}\n\n"
         "━━━━━━━━━━━━━━\n"
         "⏰ 請在 30 分鐘內完成轉帳\n\n"
-        f"✅ 實際應付金額固定為 "
-        f"{Decimal(order.amount_usdt):g} USDT\n"
-        "⚠️ 請務必使用 TRC20 網路\n"
-        "⚠️ 請再次確認收款地址\n"
-        "⚠️ 交易所手續費由付款方承擔\n\n"
         "完成轉帳後請按：\n"
-        "✅ 我已支付"
+        "✅ 我已支付\n\n"
+        f"🕒 訂單到期時間：{expire_text}\n\n"
+        "❗ 請務必使用 TRC20 網路轉帳，"
+        "轉錯網路可能無法找回。\n"
+        f"❗ 請確保實際到帳【{amount_text} USDT】，"
+        "不足金額將無法完成訂單，多轉金額不退。\n"
+        "❗ 以實際到帳金額為準，不是交易所顯示的"
+        "轉出金額；平台／交易所手續費由付款方承擔。\n"
+        "❗ 請再次核對收款地址後再轉帳。\n"
+        "❗ 若使用個人錢包轉帳，請預留足夠 TRX "
+        "支付 TRON 網路手續費。\n"
+        "❗ 轉帳通常需要鏈上確認，請完成後再按"
+        "【我已支付】。"
     )
 
     await context.bot.send_photo(
@@ -1348,7 +1406,7 @@ async def send_my_orders(
     for order in orders:
         lines.append(
             f"📄 {order.order_id}\n"
-            f"💵 {Decimal(order.amount_usdt):g} USDT\n"
+            f"💵 {format_usdt_amount(order.amount_usdt)} USDT\n"
             f"📌 {status_label(order.status)}\n"
             f"🕒 {fmt_time(order.created_at)}\n"
         )
@@ -1523,7 +1581,7 @@ async def admin_orders(
             f"📄 {order.order_id}\n"
             f"👤 {order.full_name}｜{username}\n"
             f"🆔 {order.user_id}\n"
-            f"💵 {Decimal(order.amount_usdt):g} USDT\n"
+            f"💵 {format_usdt_amount(order.amount_usdt)} USDT\n"
             f"📌 {status_label(order.status)}\n"
             f"🕒 {fmt_time(order.created_at)}\n"
         )
@@ -1578,7 +1636,7 @@ async def admin_order_detail(
         f"👤 名稱：{order.full_name}\n"
         f"🔗 Username：{username}\n"
         f"🆔 User ID：{order.user_id}\n"
-        f"💵 金額：{Decimal(order.amount_usdt):g} USDT\n"
+        f"💵 金額：{format_usdt_amount(order.amount_usdt)} USDT\n"
         f"💱 匯率：1 USDT ≈ NT${rate_text}\n\n"
         f"建立：{fmt_time(order.created_at)}\n"
         f"到期：{fmt_time(order.expires_at)}\n"
@@ -1593,18 +1651,47 @@ async def admin_order_detail(
 # HOME + BOTTOM MENU
 # =========================================================
 
+async def send_home_content(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    caption = (
+        "✨ 77VIP 專屬內容\n\n"
+        "🎬 VIP 內容持續更新\n"
+        "🔒 加入後可查看 77VIP 頻道內的專屬內容\n\n"
+        f"🔥 永久 VIP｜{format_usdt_amount(VIP_PRICE_USDT)} USDT\n"
+        "💵 付款方式：USDT / TRC20\n\n"
+        "付款完成並經管理員確認後，"
+        "系統會自動傳送專屬 VIP 邀請連結。\n\n"
+        "👇 請選擇下方功能"
+    )
+
+    if HOME_VIDEO_PATH.exists():
+        with HOME_VIDEO_PATH.open("rb") as video:
+            await context.bot.send_video(
+                chat_id=chat_id,
+                video=video,
+                caption=caption,
+                supports_streaming=True,
+                reply_markup=home_inline_keyboard(),
+            )
+        return
+
+    # 若部署時忘了放 home_video.mp4，Bot 仍可正常使用
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=caption,
+        reply_markup=home_inline_keyboard(),
+    )
+
+
 async def show_home_message(
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await context.bot.send_message(
+    await send_home_content(
         chat_id=chat_id,
-        text=(
-            "✨ 77VIP 專屬入口\n\n"
-            f"🔥 永久 VIP｜{VIP_PRICE_USDT} USDT\n"
-            "💵 USDT（TRC20）付款"
-        ),
-        reply_markup=home_inline_keyboard(),
+        context=context,
     )
 
 
@@ -1671,7 +1758,7 @@ async def button_handler(
         try:
             await query.edit_message_text(
                 "✨ 77VIP 專屬入口\n\n"
-                f"🔥 永久 VIP｜{VIP_PRICE_USDT} USDT\n"
+                f"🔥 永久 VIP｜{format_usdt_amount(VIP_PRICE_USDT)} USDT\n"
                 "💵 USDT（TRC20）付款",
                 reply_markup=home_inline_keyboard(),
             )
