@@ -66,6 +66,20 @@ VIP_CHANNEL_ID = int(os.environ["VIP_CHANNEL_ID"])
 VIP_PRICE_USDT = Decimal(os.environ.get("VIP_PRICE_USDT", "10"))
 USDT_TRC20_ADDRESS = os.environ["USDT_TRC20_ADDRESS"]
 
+
+# =========================================================
+# TELEGRAM APPLICATION
+# =========================================================
+
+telegram_app = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .build()
+)
+
+# 背景訂單逾時檢查工作
+order_expiry_task = None
+
 # Render 正式環境請設定 DATABASE_URL 為 Render PostgreSQL Internal Database URL。
 # 未設定時只作為本機測試，使用 SQLite。
 RAW_DATABASE_URL = os.environ.get(
