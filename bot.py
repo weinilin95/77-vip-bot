@@ -1,7 +1,16 @@
 import os
+import io
+import secrets
+from decimal import Decimal, ROUND_UP
 from datetime import datetime, timedelta, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import qrcode
+
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -9,30 +18,106 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 
 
+# =========================================================
+# ENV
+# =========================================================
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PUBLIC_CHANNEL_URL = os.environ["PUBLIC_CHANNEL_URL"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
+
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 VIP_CHANNEL_ID = int(os.environ["VIP_CHANNEL_ID"])
+
+VIP_PRICE_CNY = Decimal(
+    os.environ.get("VIP_PRICE_CNY", "88.88")
+)
+
+USDT_CNY_RATE = Decimal(
+    os.environ.get("USDT_CNY_RATE", "6.66")
+)
+
+USDT_TRC20_ADDRESS = os.environ["USDT_TRC20_ADDRESS"]
+
 
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 
-# =========================
+# =========================================================
+# 工具
+# =========================================================
+
+def get_usdt_amount():
+    """
+    人民幣價格 ÷ USDT/CNY 匯率
+    小數點後保留 2 位，向上取整。
+    """
+    amount = VIP_PRICE_CNY / USDT_CNY_RATE
+
+    return amount.quantize(
+        Decimal("0.01"),
+        rounding=ROUND_UP
+    )
+
+
+def create_order_id():
+    now = datetime.now(timezone.utc)
+
+    date_text = now.strftime("%Y%m%d")
+
+    random_text = secrets.token_hex(3).upper()
+
+    return f"VIP{date_text}{random_text}"
+
+
+def create_usdt_qr(address):
+    qr = qrcode.QRCode(
+        version=1,
+        box_size=10,
+        border=3
+    )
+
+    qr.add_data(address)
+    qr.make(fit=True)
+
+    image = qr.make_image(
+        fill_color="black",
+        back_color="white"
+    )
+
+    output = io.BytesIO()
+
+    image.save(
+        output,
+        format="PNG"
+    )
+
+    output.seek(0)
+    output.name = "usdt_trc20.png"
+
+    return output
+
+
+# =========================================================
 # /start
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     keyboard = [
         [
             InlineKeyboardButton(
-                "🔥 申請加入 VIP",
-                callback_data="apply_vip"
+                "🔥 購買永久 VIP",
+                callback_data="buy_vip"
             )
         ],
         [
@@ -45,16 +130,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "✨ 歡迎來到 77VIP\n\n"
-        "這裡是 77限定的 VIP 專屬入口 🔐\n"
+        "🔐 77VIP 專屬入口\n\n"
+        f"🔥 永久 VIP｜{VIP_PRICE_CNY} 元\n\n"
         "請選擇下方功能 👇",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-# =========================
+# =========================================================
 # /myid
-# =========================
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+
+async def myid(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     user = update.effective_user
 
     await update.message.reply_text(
@@ -62,13 +152,14 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# =========================
-# VIP 申請
-# =========================
-async def apply_vip(query, context):
+# =========================================================
+# 購買 VIP
+# =========================================================
+
+async def buy_vip(query, context):
     user = query.from_user
 
-    # 先檢查是否已經是 VIP
+    # 已經是 VIP 就不需要購買
     try:
         member = await context.bot.get_chat_member(
             chat_id=VIP_CHANNEL_ID,
@@ -82,12 +173,156 @@ async def apply_vip(query, context):
         ]:
             await query.edit_message_text(
                 "✨ 你已經是 77VIP 會員囉！\n\n"
-                "不需要再次申請 🔐"
+                "不需要再次購買 🔐"
             )
             return
 
     except Exception:
         pass
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💵 USDT",
+                callback_data="pay_usdt"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⭐ Telegram Stars",
+                callback_data="pay_stars"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🌍 國際代付",
+                callback_data="pay_other"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 返回",
+                callback_data="home"
+            )
+        ]
+    ])
+
+    await query.edit_message_text(
+        "💳 請選擇付款方式\n\n"
+        f"🔥 永久 VIP：{VIP_PRICE_CNY} 元",
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# USDT 訂單
+# =========================================================
+
+async def pay_usdt(query, context):
+    user = query.from_user
+
+    order_id = create_order_id()
+
+    usdt_amount = get_usdt_amount()
+
+    expire_time = (
+        datetime.now(timezone.utc)
+        + timedelta(minutes=30)
+    )
+
+    # 暫存在 user_data
+    context.user_data["payment"] = {
+        "order_id": order_id,
+        "amount": str(usdt_amount),
+        "expire_timestamp": expire_time.timestamp()
+    }
+
+    qr_image = create_usdt_qr(
+        USDT_TRC20_ADDRESS
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ 我已支付",
+                callback_data="payment_done"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ 取消支付",
+                callback_data="cancel_payment"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 首頁",
+                callback_data="home"
+            )
+        ]
+    ])
+
+    text = (
+        "💵 USDT付款\n\n"
+        f"訂單號：{order_id}\n"
+        f"匯率：{USDT_CNY_RATE}\n"
+        f"支付金額：{usdt_amount} USDT\n\n"
+        "收款地址（TRC20）：\n"
+        f"{USDT_TRC20_ADDRESS}\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "⏰ 請在 30 分鐘內完成轉帳\n\n"
+        "⚠️ 請務必使用 TRC20 網路\n"
+        "⚠️ 請確認地址後再進行轉帳\n"
+        "⚠️ 交易所手續費由付款方承擔\n\n"
+        "完成轉帳後請按：\n"
+        "✅ 我已支付"
+    )
+
+    # 先把選單訊息改掉
+    await query.edit_message_text(
+        "⏳ 正在建立 USDT 訂單..."
+    )
+
+    # 發 QR Code + 訂單
+    await context.bot.send_photo(
+        chat_id=user.id,
+        photo=qr_image,
+        caption=text,
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# 使用者表示已付款
+# =========================================================
+
+async def payment_done(query, context):
+    user = query.from_user
+
+    payment = context.user_data.get(
+        "payment"
+    )
+
+    if not payment:
+        await query.answer(
+            "找不到有效訂單，請重新建立。",
+            show_alert=True
+        )
+        return
+
+    now = datetime.now(
+        timezone.utc
+    ).timestamp()
+
+    if now > payment["expire_timestamp"]:
+        await query.answer(
+            "此訂單已超過 30 分鐘，請重新建立訂單。",
+            show_alert=True
+        )
+        return
+
+    order_id = payment["order_id"]
+    amount = payment["amount"]
 
     username = (
         f"@{user.username}"
@@ -98,12 +333,18 @@ async def apply_vip(query, context):
     admin_keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "✅ 批准",
-                callback_data=f"approve:{user.id}"
-            ),
+                "✅ 確認收款",
+                callback_data=(
+                    f"paidok:{user.id}:{order_id}"
+                )
+            )
+        ],
+        [
             InlineKeyboardButton(
-                "❌ 拒絕",
-                callback_data=f"reject:{user.id}"
+                "❌ 未收到款",
+                callback_data=(
+                    f"paidno:{user.id}:{order_id}"
+                )
             )
         ]
     ])
@@ -111,42 +352,74 @@ async def apply_vip(query, context):
     await context.bot.send_message(
         chat_id=ADMIN_ID,
         text=(
-            "🔥 新的 VIP 加入申請\n\n"
+            "💰 新的 VIP 付款確認\n\n"
+            f"📄 訂單：{order_id}\n"
+            f"💵 金額：{amount} USDT\n\n"
             f"👤 名稱：{user.full_name}\n"
             f"🔗 Username：{username}\n"
             f"🆔 User ID：{user.id}\n\n"
-            "請選擇是否批准："
+            "⚠️ 請先確認自己的錢包／交易紀錄，"
+            "確定實際收到款項後再批准。"
         ),
         reply_markup=admin_keyboard
     )
 
-    await query.edit_message_text(
-        "✅ VIP 申請已送出\n\n"
-        "管理員收到你的申請了。\n"
-        "審核完成後，Bot 會直接通知你 🔔"
+    await query.edit_message_caption(
+        caption=(
+            f"✅ 已提交付款確認\n\n"
+            f"訂單：{order_id}\n"
+            f"金額：{amount} USDT\n\n"
+            "正在等待管理員確認收款。\n"
+            "確認完成後 Bot 會通知你 🔔"
+        )
     )
 
 
-# =========================
-# 管理員批准
-# =========================
-async def approve_vip(query, context, user_id):
+# =========================================================
+# 管理員確認收到款
+# =========================================================
+
+async def payment_approve(
+    query,
+    context,
+    user_id,
+    order_id
+):
     if query.from_user.id != ADMIN_ID:
+        await query.answer(
+            "你沒有管理員權限。",
+            show_alert=True
+        )
         return
 
     try:
+        # 若曾被移除，先解除封鎖
+        try:
+            await context.bot.unban_chat_member(
+                chat_id=VIP_CHANNEL_ID,
+                user_id=user_id,
+                only_if_banned=True
+            )
+        except Exception as e:
+            print(
+                f"Unban error: {e}"
+            )
+
+        # VIP 邀請 30 分鐘有效
         expire_time = (
             datetime.now(timezone.utc)
             + timedelta(minutes=30)
         )
 
-        invite = await context.bot.create_chat_invite_link(
-            chat_id=VIP_CHANNEL_ID,
-            expire_date=expire_time,
-            name=f"VIP-{user_id}"
+        invite = (
+            await context.bot.create_chat_invite_link(
+                chat_id=VIP_CHANNEL_ID,
+                expire_date=expire_time,
+                name=f"VIP-{user_id}"
+            )
         )
 
-        keyboard = InlineKeyboardMarkup([
+        vip_keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
                     "🔐 進入 77VIP",
@@ -158,76 +431,145 @@ async def approve_vip(query, context, user_id):
         await context.bot.send_message(
             chat_id=user_id,
             text=(
-                "🎉 你的 VIP 申請已通過！\n\n"
+                "🎉 付款確認完成！\n\n"
+                f"📄 訂單：{order_id}\n"
+                "✅ VIP 已開通\n\n"
                 "下方是你的專屬加入連結 🔐\n\n"
-                "⚠️ 此專屬連結將於 30 分鐘後失效。\n"
-                "成功加入後，此邀請連結會立即失效。"
+                "⚠️ 邀請連結 30 分鐘後失效。\n"
+                "成功加入後，邀請連結會立即撤銷。"
             ),
-            reply_markup=keyboard
+            reply_markup=vip_keyboard
         )
 
         await query.edit_message_text(
             query.message.text
             + "\n\n"
-            + "✅ 已批准\n"
-            + "專屬邀請連結已傳送給會員。"
+            + "✅ 已確認收款\n"
+            + "✅ VIP 邀請已傳送"
         )
 
     except Exception as e:
-        print(f"Approve error: {e}")
+        print(
+            f"Payment approve error: {e}"
+        )
 
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"❌ 建立 VIP 邀請連結失敗：\n{e}"
+            text=(
+                "❌ VIP 開通失敗\n\n"
+                f"訂單：{order_id}\n"
+                f"User ID：{user_id}\n"
+                f"錯誤：{e}"
+            )
         )
 
 
-# =========================
-# 管理員拒絕
-# =========================
-async def reject_vip(query, context, user_id):
+# =========================================================
+# 管理員：未收到款
+# =========================================================
+
+async def payment_reject(
+    query,
+    context,
+    user_id,
+    order_id
+):
     if query.from_user.id != ADMIN_ID:
+        await query.answer(
+            "你沒有管理員權限。",
+            show_alert=True
+        )
         return
 
     try:
         await context.bot.send_message(
             chat_id=user_id,
             text=(
-                "❌ 你的 VIP 申請目前未通過。\n\n"
-                "如有疑問，請聯絡管理員。"
+                "⚠️ 目前尚未確認收到款項。\n\n"
+                f"📄 訂單：{order_id}\n\n"
+                "請再次確認：\n"
+                "• TRC20 網路是否正確\n"
+                "• 收款地址是否正確\n"
+                "• 交易是否已完成\n\n"
+                "如已付款，可稍後再聯絡管理員確認。"
             )
         )
 
         await query.edit_message_text(
             query.message.text
-            + "\n\n"
-            + "❌ 已拒絕"
+            + "\n\n❌ 尚未確認收到款"
         )
 
     except Exception as e:
-        print(f"Reject error: {e}")
+        print(
+            f"Payment reject error: {e}"
+        )
 
 
-# =========================
+# =========================================================
+# 取消付款
+# =========================================================
+
+async def cancel_payment(
+    query,
+    context
+):
+    context.user_data.pop(
+        "payment",
+        None
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔥 重新購買 VIP",
+                callback_data="buy_vip"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 首頁",
+                callback_data="home"
+            )
+        ]
+    ])
+
+    try:
+        await query.edit_message_caption(
+            caption="❌ 訂單已取消。",
+            reply_markup=keyboard
+        )
+    except Exception:
+        await query.edit_message_text(
+            "❌ 訂單已取消。",
+            reply_markup=keyboard
+        )
+
+
+# =========================================================
 # VIP 加入成功
-# 自動撤銷專屬邀請連結
-# =========================
+# 自動撤銷邀請連結
+# =========================================================
+
 async def vip_member_update(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    chat_member_update = update.chat_member
+    member_update = update.chat_member
 
-    if not chat_member_update:
+    if not member_update:
         return
 
-    # 只處理 77VIP 頻道
-    if chat_member_update.chat.id != VIP_CHANNEL_ID:
+    if (
+        member_update.chat.id
+        != VIP_CHANNEL_ID
+    ):
         return
 
-    new_member = chat_member_update.new_chat_member
+    new_member = (
+        member_update.new_chat_member
+    )
 
-    # 確認會員真的已經加入
     if new_member.status not in [
         "member",
         "administrator",
@@ -237,133 +579,231 @@ async def vip_member_update(
 
     user = new_member.user
 
-    # Telegram 會告訴 Bot 這次加入使用的是哪條邀請連結
-    invite_link = chat_member_update.invite_link
+    invite_link = (
+        member_update.invite_link
+    )
 
     if not invite_link:
         return
 
-    # 只處理由我們 Bot 建立的 VIP 專屬連結
-    expected_name = f"VIP-{user.id}"
+    expected_name = (
+        f"VIP-{user.id}"
+    )
 
-    if invite_link.name != expected_name:
+    if (
+        invite_link.name
+        != expected_name
+    ):
         return
 
     try:
-        # 成功加入後立即撤銷連結
         await context.bot.revoke_chat_invite_link(
             chat_id=VIP_CHANNEL_ID,
-            invite_link=invite_link.invite_link
+            invite_link=(
+                invite_link.invite_link
+            )
         )
 
-        print(
-            f"VIP joined: {user.id} "
-            f"- invite link revoked"
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "✅ 已成功加入 77VIP！\n\n"
+                "🔒 你的專屬邀請連結"
+                "已自動失效。"
+            )
         )
 
-        # 通知會員
-        try:
-            await context.bot.send_message(
-                chat_id=user.id,
-                text=(
-                    "✅ 已成功加入 77VIP！\n\n"
-                    "🔐 你的專屬邀請連結已自動失效。"
-                )
-            )
-        except Exception as e:
-            print(f"Member notification error: {e}")
+        username = (
+            f"@{user.username}"
+            if user.username
+            else "未設定"
+        )
 
-        # 通知管理員
-        try:
-            username = (
-                f"@{user.username}"
-                if user.username
-                else "未設定"
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "✅ VIP 會員已成功加入\n\n"
+                f"👤 名稱：{user.full_name}\n"
+                f"🔗 Username：{username}\n"
+                f"🆔 User ID：{user.id}\n\n"
+                "🔒 專屬邀請連結已撤銷。"
             )
-
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "✅ VIP 會員已成功加入\n\n"
-                    f"👤 名稱：{user.full_name}\n"
-                    f"🔗 Username：{username}\n"
-                    f"🆔 User ID：{user.id}\n\n"
-                    "🔒 專屬邀請連結已自動撤銷。"
-                )
-            )
-
-        except Exception as e:
-            print(f"Admin notification error: {e}")
+        )
 
     except Exception as e:
-        print(f"Revoke invite error: {e}")
+        print(
+            f"Revoke invite error: {e}"
+        )
 
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "⚠️ 會員已加入，但邀請連結自動撤銷失敗。\n\n"
-                    f"User ID：{user.id}\n"
-                    f"錯誤：{e}"
-                )
+
+# =========================================================
+# 尚未開放付款方式
+# =========================================================
+
+async def payment_not_ready(
+    query,
+    context
+):
+    await query.answer(
+        "此付款方式目前尚未開放。",
+        show_alert=True
+    )
+
+
+# =========================================================
+# 首頁
+# =========================================================
+
+async def show_home(
+    query,
+    context
+):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔥 購買永久 VIP",
+                callback_data="buy_vip"
             )
-        except Exception:
-            pass
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 返回 77限定",
+                url=PUBLIC_CHANNEL_URL
+            )
+        ]
+    ])
+
+    try:
+        await query.edit_message_caption(
+            caption=(
+                "✨ 歡迎來到 77VIP\n\n"
+                f"🔥 永久 VIP｜"
+                f"{VIP_PRICE_CNY} 元"
+            ),
+            reply_markup=keyboard
+        )
+
+    except Exception:
+        await query.edit_message_text(
+            "✨ 歡迎來到 77VIP\n\n"
+            f"🔥 永久 VIP｜"
+            f"{VIP_PRICE_CNY} 元",
+            reply_markup=keyboard
+        )
 
 
-# =========================
-# Inline Button
-# =========================
+# =========================================================
+# Button Router
+# =========================================================
+
 async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
+
     await query.answer()
 
     data = query.data
 
-    if data == "apply_vip":
-        await apply_vip(query, context)
-        return
-
-    if data.startswith("approve:"):
-        user_id = int(data.split(":")[1])
-
-        await approve_vip(
+    if data == "buy_vip":
+        await buy_vip(
             query,
-            context,
-            user_id
+            context
         )
         return
 
-    if data.startswith("reject:"):
-        user_id = int(data.split(":")[1])
+    if data == "pay_usdt":
+        await pay_usdt(
+            query,
+            context
+        )
+        return
 
-        await reject_vip(
+    if data == "payment_done":
+        await payment_done(
+            query,
+            context
+        )
+        return
+
+    if data == "cancel_payment":
+        await cancel_payment(
+            query,
+            context
+        )
+        return
+
+    if data == "home":
+        await show_home(
+            query,
+            context
+        )
+        return
+
+    if data in [
+        "pay_stars",
+        "pay_other"
+    ]:
+        await payment_not_ready(
+            query,
+            context
+        )
+        return
+
+    if data.startswith("paidok:"):
+        parts = data.split(":")
+
+        user_id = int(parts[1])
+        order_id = parts[2]
+
+        await payment_approve(
             query,
             context,
-            user_id
+            user_id,
+            order_id
+        )
+        return
+
+    if data.startswith("paidno:"):
+        parts = data.split(":")
+
+        user_id = int(parts[1])
+        order_id = parts[2]
+
+        await payment_reject(
+            query,
+            context,
+            user_id,
+            order_id
         )
         return
 
 
-# =========================
+# =========================================================
 # Telegram handlers
-# =========================
+# =========================================================
+
 telegram_app.add_handler(
-    CommandHandler("start", start)
+    CommandHandler(
+        "start",
+        start
+    )
 )
 
 telegram_app.add_handler(
-    CommandHandler("myid", myid)
+    CommandHandler(
+        "myid",
+        myid
+    )
 )
 
 telegram_app.add_handler(
-    CallbackQueryHandler(button_handler)
+    CallbackQueryHandler(
+        button_handler
+    )
 )
 
-# 偵測會員加入/退出 VIP
 telegram_app.add_handler(
     ChatMemberHandler(
         vip_member_update,
@@ -372,19 +812,21 @@ telegram_app.add_handler(
 )
 
 
-# =========================
-# Render 首頁
-# =========================
-async def homepage(request: Request):
+# =========================================================
+# Render
+# =========================================================
+
+async def homepage(
+    request: Request
+):
     return PlainTextResponse(
-        "77 VIP Bot V2.1 is running!"
+        "77 VIP Bot V3 is running!"
     )
 
 
-# =========================
-# Telegram Webhook
-# =========================
-async def webhook(request: Request):
+async def webhook(
+    request: Request
+):
     data = await request.json()
 
     update = Update.de_json(
@@ -392,14 +834,13 @@ async def webhook(request: Request):
         bot=telegram_app.bot
     )
 
-    await telegram_app.process_update(update)
+    await telegram_app.process_update(
+        update
+    )
 
     return PlainTextResponse("OK")
 
 
-# =========================
-# 啟動
-# =========================
 async def startup():
     await telegram_app.initialize()
 
@@ -413,9 +854,6 @@ async def startup():
     )
 
 
-# =========================
-# 關閉
-# =========================
 async def shutdown():
     await telegram_app.shutdown()
 
@@ -425,7 +863,10 @@ app = Starlette(
         Route(
             "/",
             homepage,
-            methods=["GET", "HEAD"]
+            methods=[
+                "GET",
+                "HEAD"
+            ]
         ),
         Route(
             "/webhook",
