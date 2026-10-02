@@ -66,6 +66,7 @@ VIP_CHANNEL_ID = int(os.environ["VIP_CHANNEL_ID"])
 
 VIP_PRICE_USDT = Decimal(os.environ.get("VIP_PRICE_USDT", "10"))
 USDT_TRC20_ADDRESS = os.environ["USDT_TRC20_ADDRESS"]
+HOME_VIDEO_PATH = Path(__file__).with_name("home_video.mp4")
 
 
 # =========================================================
