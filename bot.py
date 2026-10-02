@@ -6,6 +6,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -16,6 +18,7 @@ from starlette.routing import Route
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PUBLIC_CHANNEL_URL = os.environ["PUBLIC_CHANNEL_URL"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 
 
 telegram_app = Application.builder().token(BOT_TOKEN).build()
@@ -51,12 +54,34 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     await update.message.reply_text(
-        f"🆔 你的 Telegram ID：\n\n"
-        f"{user.id}"
+        f"🆔 你的 Telegram ID：\n\n{user.id}"
     )
 
 
-# 按鈕處理
+# 偵測頻道貼文，將 Channel ID 私訊給管理員
+async def channel_post_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    channel_post = update.channel_post
+
+    if not channel_post:
+        return
+
+    chat = channel_post.chat
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            "📡 偵測到頻道\n\n"
+            f"名稱：{chat.title}\n"
+            f"Channel ID：\n`{chat.id}`"
+        ),
+        parse_mode="Markdown"
+    )
+
+
+# 按鈕
 async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -72,18 +97,25 @@ async def button_handler(
         )
 
 
-# Telegram handlers
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("myid", myid))
-telegram_app.add_handler(CallbackQueryHandler(button_handler))
+
+telegram_app.add_handler(
+    MessageHandler(
+        filters.UpdateType.CHANNEL_POST,
+        channel_post_handler
+    )
+)
+
+telegram_app.add_handler(
+    CallbackQueryHandler(button_handler)
+)
 
 
-# Render 首頁
 async def homepage(request: Request):
     return PlainTextResponse("77 VIP Bot is running!")
 
 
-# Telegram Webhook
 async def webhook(request: Request):
     data = await request.json()
 
@@ -97,16 +129,19 @@ async def webhook(request: Request):
     return PlainTextResponse("OK")
 
 
-# 啟動
 async def startup():
     await telegram_app.initialize()
 
     await telegram_app.bot.set_webhook(
-        url=f"{WEBHOOK_URL}/webhook"
+        url=f"{WEBHOOK_URL}/webhook",
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "channel_post",
+        ]
     )
 
 
-# 關閉
 async def shutdown():
     await telegram_app.shutdown()
 
