@@ -40,6 +40,7 @@ from sqlalchemy import (
     Text,
     select,
     update as sql_update,
+    text as sql_text,
 )
 from sqlalchemy.ext.asyncio import (
     AsyncAttrs,
@@ -65,8 +66,27 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 VIP_CHANNEL_ID = int(os.environ["VIP_CHANNEL_ID"])
 
 VIP_PRICE_USDT = Decimal(os.environ.get("VIP_PRICE_USDT", "10"))
-USDT_TRC20_ADDRESS = os.environ["USDT_TRC20_ADDRESS"]
 HOME_VIDEO_PATH = Path(__file__).with_name("home_video.mp4")
+USDT_TRC20_ADDRESS = os.environ["USDT_TRC20_ADDRESS"]
+
+# TRON / USDT 自動查帳
+TRONGRID_BASE_URL = os.environ.get(
+    "TRONGRID_BASE_URL",
+    "https://api.trongrid.io",
+).rstrip("/")
+TRONGRID_API_KEY = os.environ.get("TRONGRID_API_KEY", "").strip()
+USDT_TRC20_CONTRACT = os.environ.get(
+    "USDT_TRC20_CONTRACT",
+    "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+).strip()
+AUTO_PAYMENT_ENABLED = (
+    os.environ.get("AUTO_PAYMENT_ENABLED", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+AUTO_PAYMENT_POLL_SECONDS = max(
+    15,
+    int(os.environ.get("AUTO_PAYMENT_POLL_SECONDS", "30")),
+)
 
 
 # =========================================================
@@ -81,6 +101,8 @@ telegram_app = (
 
 # 背景訂單逾時檢查工作
 order_expiry_task = None
+# TRON 自動查帳工作
+tron_payment_task = None
 
 # Render 正式環境請設定 DATABASE_URL 為 Render PostgreSQL Internal Database URL。
 # 未設定時只作為本機測試，使用 SQLite。
@@ -198,6 +220,23 @@ class Order(Base):
     )
 
 
+    txid: Mapped[Optional[str]] = mapped_column(
+        String(128),
+        nullable=True,
+        index=True,
+    )
+
+    detected_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    payment_source: Mapped[Optional[str]] = mapped_column(
+        String(32),
+        nullable=True,
+    )
+
+
 engine = create_async_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -207,6 +246,63 @@ SessionLocal = async_sessionmaker(
     engine,
     expire_on_commit=False,
 )
+
+
+
+# =========================================================
+# DATABASE MIGRATION
+# =========================================================
+
+async def migrate_order_table():
+    """
+    create_all() 不會替既有資料表新增欄位，
+    所以啟動時補上自動查帳需要的欄位。
+    """
+    async with engine.begin() as conn:
+        dialect = conn.dialect.name
+
+        if dialect == "postgresql":
+            await conn.execute(sql_text(
+                "ALTER TABLE orders "
+                "ADD COLUMN IF NOT EXISTS txid VARCHAR(128)"
+            ))
+            await conn.execute(sql_text(
+                "ALTER TABLE orders "
+                "ADD COLUMN IF NOT EXISTS detected_at TIMESTAMPTZ"
+            ))
+            await conn.execute(sql_text(
+                "ALTER TABLE orders "
+                "ADD COLUMN IF NOT EXISTS payment_source VARCHAR(32)"
+            ))
+            await conn.execute(sql_text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_orders_txid_unique "
+                "ON orders (txid) WHERE txid IS NOT NULL"
+            ))
+            return
+
+        if dialect == "sqlite":
+            rows = (
+                await conn.execute(sql_text("PRAGMA table_info(orders)"))
+            ).fetchall()
+            columns = {row[1] for row in rows}
+
+            if "txid" not in columns:
+                await conn.execute(sql_text(
+                    "ALTER TABLE orders ADD COLUMN txid VARCHAR(128)"
+                ))
+            if "detected_at" not in columns:
+                await conn.execute(sql_text(
+                    "ALTER TABLE orders ADD COLUMN detected_at DATETIME"
+                ))
+            if "payment_source" not in columns:
+                await conn.execute(sql_text(
+                    "ALTER TABLE orders ADD COLUMN payment_source VARCHAR(32)"
+                ))
+            await conn.execute(sql_text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_orders_txid_unique ON orders (txid)"
+            ))
 
 
 # =========================================================
@@ -320,7 +416,7 @@ async def expire_due_orders(user_id: Optional[int] = None):
     """
     async with SessionLocal() as session:
         stmt = (
-            sql_sql_update(Order)
+            sql_update(Order)
             .where(
                 Order.status == "pending",
                 Order.expires_at < now_utc(),
@@ -526,7 +622,7 @@ async def notify_expired_orders():
 
         for order in expired_candidates:
             changed = await session.execute(
-                sql_sql_update(Order)
+                sql_update(Order)
                 .where(
                     Order.order_id == order.order_id,
                     Order.status == "pending",
@@ -606,6 +702,48 @@ async def order_expiry_worker():
         await asyncio.sleep(30)
 
 
+
+# =========================================================
+# UNIQUE PAYMENT AMOUNT
+# =========================================================
+
+async def allocate_unique_usdt_amount(
+    session,
+) -> Decimal:
+    """
+    產生 VIP_PRICE_USDT + 0.0001 ~ 0.0999 的唯一尾數。
+    同時間 active 訂單不重複。
+    """
+    active_statuses = [
+        "pending",
+        "awaiting_review",
+        "processing",
+    ]
+
+    result = await session.execute(
+        select(Order.amount_usdt).where(
+            Order.status.in_(active_statuses)
+        )
+    )
+
+    used = {
+        Decimal(value).quantize(Decimal("0.0001"))
+        for value in result.scalars().all()
+    }
+
+    # 隨機嘗試，最多可同時容納 999 個不同尾數。
+    for _ in range(2000):
+        suffix = Decimal(secrets.randbelow(999) + 1) / Decimal("10000")
+        amount = (
+            VIP_PRICE_USDT + suffix
+        ).quantize(Decimal("0.0001"))
+
+        if amount not in used:
+            return amount
+
+    raise RuntimeError("目前待付款訂單過多，無法分配唯一付款金額")
+
+
 # =========================================================
 # ORDER CREATION
 # =========================================================
@@ -636,7 +774,7 @@ async def create_order_for_user(user) -> Order:
 
         # 舊的 pending 改為取消，避免同時有多筆待付款訂單。
         await session.execute(
-            sql_sql_update(Order)
+            sql_update(Order)
             .where(
                 Order.user_id == user.id,
                 Order.status == "pending",
@@ -648,13 +786,16 @@ async def create_order_for_user(user) -> Order:
         )
 
         rate = await get_usdt_twd_rate()
+        unique_amount = await allocate_unique_usdt_amount(
+            session
+        )
 
         order = Order(
             order_id=create_order_id(),
             user_id=user.id,
             username=user.username,
             full_name=user.full_name,
-            amount_usdt=VIP_PRICE_USDT,
+            amount_usdt=unique_amount,
             rate_twd=rate,
             status="pending",
             created_at=now_utc(),
@@ -665,6 +806,317 @@ async def create_order_for_user(user) -> Order:
         await session.commit()
         await session.refresh(order)
         return order
+
+
+
+# =========================================================
+# TRON AUTO PAYMENT MONITOR
+# =========================================================
+
+def _trongrid_headers():
+    headers = {
+        "accept": "application/json",
+    }
+    if TRONGRID_API_KEY:
+        headers["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
+    return headers
+
+
+async def fetch_recent_usdt_incoming():
+    """
+    只抓已確認、匯入收款地址、且為官方 USDT TRC20 合約的交易。
+    """
+    url = (
+        f"{TRONGRID_BASE_URL}/v1/accounts/"
+        f"{USDT_TRC20_ADDRESS}/transactions/trc20"
+    )
+    params = {
+        "only_confirmed": "true",
+        "only_to": "true",
+        "limit": 200,
+        "order_by": "block_timestamp,desc",
+        "contract_address": USDT_TRC20_CONTRACT,
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            url,
+            params=params,
+            headers=_trongrid_headers(),
+        )
+
+    if response.status_code == 429:
+        raise RuntimeError("TronGrid 429 Too Many Requests")
+
+    response.raise_for_status()
+    payload = response.json()
+
+    if not payload.get("success", True):
+        raise RuntimeError("TronGrid 回傳 success=false")
+
+    return payload.get("data", [])
+
+
+async def auto_open_vip_for_order(
+    order_id: str,
+    txid: str,
+):
+    """
+    鏈上入帳後自動建立 VIP 邀請。
+    狀態採 atomic transition，避免與人工審核重複執行。
+    """
+    now = now_utc()
+
+    async with SessionLocal() as session:
+        changed = await session.execute(
+            sql_update(Order)
+            .where(
+                Order.order_id == order_id,
+                Order.status.in_(
+                    ["pending", "awaiting_review"]
+                ),
+            )
+            .values(
+                status="processing",
+                txid=txid,
+                detected_at=now,
+                payment_source="trongrid_auto",
+            )
+        )
+        await session.commit()
+
+        if changed.rowcount != 1:
+            return False
+
+        result = await session.execute(
+            select(Order).where(Order.order_id == order_id)
+        )
+        order = result.scalar_one()
+
+        user_id = order.user_id
+        amount = Decimal(order.amount_usdt)
+
+    try:
+        try:
+            await telegram_app.bot.unban_chat_member(
+                chat_id=VIP_CHANNEL_ID,
+                user_id=user_id,
+                only_if_banned=True,
+            )
+        except Exception as e:
+            print(f"Auto unban warning: {e}")
+
+        invite = await telegram_app.bot.create_chat_invite_link(
+            chat_id=VIP_CHANNEL_ID,
+            expire_date=now_utc() + timedelta(minutes=30),
+            name=f"VIP-{order_id}",
+        )
+
+        vip_keyboard = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton(
+                    "🔐 進入 77VIP",
+                    url=invite.invite_link,
+                )
+            ]]
+        )
+
+        await telegram_app.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎉 已自動確認 USDT 入帳！\n\n"
+                f"📄 訂單：{order_id}\n"
+                f"💵 入帳金額：{format_usdt_amount(amount)} USDT\n"
+                f"🔗 TXID：{txid[:10]}...{txid[-8:]}\n\n"
+                "✅ VIP 已自動開通\n"
+                "下方是你的專屬加入連結 🔐\n\n"
+                "⚠️ 邀請連結 30 分鐘後失效；"
+                "成功加入後會立即撤銷。"
+            ),
+            reply_markup=vip_keyboard,
+        )
+
+        async with SessionLocal() as session:
+            await session.execute(
+                sql_update(Order)
+                .where(
+                    Order.order_id == order_id,
+                    Order.status == "processing",
+                )
+                .values(
+                    status="approved",
+                    approved_at=now_utc(),
+                    invite_link=invite.invite_link,
+                )
+            )
+            await session.commit()
+
+        await telegram_app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "🤖 USDT 自動入帳成功\n\n"
+                f"📄 訂單：{order_id}\n"
+                f"🆔 User ID：{user_id}\n"
+                f"💵 金額：{format_usdt_amount(amount)} USDT\n"
+                f"🔗 TXID：{txid}\n\n"
+                "✅ 已自動傳送 VIP 邀請。"
+            ),
+        )
+        return True
+
+    except Exception as e:
+        print(f"Auto VIP open error: {e}")
+
+        # 自動開通失敗，改成人工備援
+        async with SessionLocal() as session:
+            await session.execute(
+                sql_update(Order)
+                .where(
+                    Order.order_id == order_id,
+                    Order.status == "processing",
+                )
+                .values(
+                    status="awaiting_review",
+                    txid=txid,
+                    detected_at=now,
+                    payment_source="auto_failed_manual",
+                )
+            )
+            await session.commit()
+
+        await telegram_app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "⚠️ 已偵測 USDT 入帳，但自動開通失敗\n\n"
+                f"📄 訂單：{order_id}\n"
+                f"🆔 User ID：{user_id}\n"
+                f"💵 金額：{format_usdt_amount(amount)} USDT\n"
+                f"🔗 TXID：{txid}\n"
+                f"錯誤：{e}\n\n"
+                "已轉為人工備援，請使用 /order 查詢後處理。"
+            ),
+        )
+        return False
+
+
+async def scan_tron_payments():
+    if not AUTO_PAYMENT_ENABLED:
+        return
+
+    transactions = await fetch_recent_usdt_incoming()
+    if not transactions:
+        return
+
+    # 先取出目前仍可自動比對的訂單
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Order).where(
+                Order.status.in_(
+                    ["pending", "awaiting_review"]
+                )
+            )
+        )
+        orders = list(result.scalars().all())
+
+        used_result = await session.execute(
+            select(Order.txid).where(Order.txid.is_not(None))
+        )
+        used_txids = {
+            txid for txid in used_result.scalars().all()
+            if txid
+        }
+
+    if not orders:
+        return
+
+    for tx in transactions:
+        txid = tx.get("transaction_id")
+        if not txid or txid in used_txids:
+            continue
+
+        if tx.get("type") not in (None, "Transfer"):
+            continue
+
+        if tx.get("to") != USDT_TRC20_ADDRESS:
+            continue
+
+        token = tx.get("token_info") or {}
+
+        if token.get("address") and (
+            token.get("address") != USDT_TRC20_CONTRACT
+        ):
+            continue
+
+        decimals = int(token.get("decimals", 6))
+        raw_value = tx.get("value")
+
+        if raw_value is None:
+            continue
+
+        try:
+            amount = (
+                Decimal(str(raw_value))
+                / (Decimal(10) ** decimals)
+            )
+        except Exception:
+            continue
+
+        tx_ms = tx.get("block_timestamp")
+        if not tx_ms:
+            continue
+
+        tx_time = datetime.fromtimestamp(
+            int(tx_ms) / 1000,
+            tz=timezone.utc,
+        )
+
+        matches = []
+        for order in orders:
+            expected = Decimal(order.amount_usdt)
+
+            if amount != expected:
+                continue
+
+            # 避免把很久以前、相同尾數的轉帳配到新訂單。
+            if tx_time < order.created_at - timedelta(minutes=2):
+                continue
+
+            if tx_time > order.expires_at + timedelta(minutes=2):
+                continue
+
+            matches.append(order)
+
+        # 唯一金額設計下正常應只有 1 筆。
+        if len(matches) != 1:
+            continue
+
+        order = matches[0]
+
+        opened = await auto_open_vip_for_order(
+            order.order_id,
+            txid,
+        )
+
+        if opened:
+            used_txids.add(txid)
+            orders = [
+                item for item in orders
+                if item.order_id != order.order_id
+            ]
+
+
+async def tron_payment_worker():
+    while True:
+        try:
+            await scan_tron_payments()
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            print(f"TRON payment worker error: {e}")
+
+        await asyncio.sleep(AUTO_PAYMENT_POLL_SECONDS)
 
 
 # =========================================================
@@ -823,8 +1275,9 @@ async def pay_usdt(query, context):
         f"{USDT_TRC20_ADDRESS}\n\n"
         "━━━━━━━━━━━━━━\n"
         "⏰ 請在 30 分鐘內完成轉帳\n\n"
-        "完成轉帳後請按：\n"
-        "✅ 我已支付\n\n"
+        "🤖 系統會自動偵測鏈上入帳並開通 VIP。\n"
+        "若付款後一段時間仍未自動開通，可按：\n"
+        "✅ 我已支付（人工備援）\n\n"
         f"🕒 訂單到期時間：{expire_text}\n\n"
         "❗ 請務必使用 TRC20 網路轉帳，"
         "轉錯網路可能無法找回。\n"
@@ -835,8 +1288,8 @@ async def pay_usdt(query, context):
         "❗ 請再次核對收款地址後再轉帳。\n"
         "❗ 若使用個人錢包轉帳，請預留足夠 TRX "
         "支付 TRON 網路手續費。\n"
-        "❗ 轉帳通常需要鏈上確認，請完成後再按"
-        "【我已支付】。"
+        "❗ 系統只會比對「已確認」的鏈上入帳；"
+        "請務必精確支付上方顯示的唯一金額。"
     )
 
     await context.bot.send_photo(
@@ -903,7 +1356,7 @@ async def payment_done(
 
         # 原子狀態轉移：pending -> awaiting_review
         changed = await session.execute(
-            sql_sql_update(Order)
+            sql_update(Order)
             .where(
                 Order.order_id == order_id,
                 Order.user_id == user.id,
@@ -1004,7 +1457,7 @@ async def payment_approve(
     # awaiting_review -> processing
     async with SessionLocal() as session:
         changed = await session.execute(
-            sql_sql_update(Order)
+            sql_update(Order)
             .where(
                 Order.order_id == order_id,
                 Order.status == "awaiting_review",
@@ -1088,7 +1541,7 @@ async def payment_approve(
 
         async with SessionLocal() as session:
             await session.execute(
-                sql_sql_update(Order)
+                sql_update(Order)
                 .where(
                     Order.order_id == order_id,
                     Order.status == "processing",
@@ -1113,7 +1566,7 @@ async def payment_approve(
         # 外部操作失敗就退回待審核，可重新按確認。
         async with SessionLocal() as session:
             await session.execute(
-                sql_sql_update(Order)
+                sql_update(Order)
                 .where(
                     Order.order_id == order_id,
                     Order.status == "processing",
@@ -1166,7 +1619,7 @@ async def payment_reject(
             return
 
         changed = await session.execute(
-            sql_sql_update(Order)
+            sql_update(Order)
             .where(
                 Order.order_id == order_id,
                 Order.status == "awaiting_review",
@@ -1197,7 +1650,7 @@ async def payment_reject(
             "請再次確認：\n"
             "• 是否使用 TRC20 網路\n"
             "• 收款地址是否正確\n"
-            f"• 是否實際轉出 {VIP_PRICE_USDT:g} USDT\n"
+            f"• 是否實際轉出該訂單顯示的唯一 USDT 金額\n"
             "• 交易是否已完成\n\n"
             "如已付款，請聯絡管理員協助確認。"
         ),
@@ -1224,7 +1677,7 @@ async def cancel_payment(
 
     async with SessionLocal() as session:
         changed = await session.execute(
-            sql_sql_update(Order)
+            sql_update(Order)
             .where(
                 Order.order_id == order_id,
                 Order.user_id == user_id,
@@ -1331,7 +1784,7 @@ async def vip_member_update(
 
         async with SessionLocal() as session:
             await session.execute(
-                sql_sql_update(Order)
+                sql_update(Order)
                 .where(
                     Order.order_id == order_id,
                     Order.user_id == user.id,
@@ -1896,11 +2349,13 @@ async def webhook(request: Request):
 
 
 async def startup():
-    global order_expiry_task
+    global order_expiry_task, tron_payment_task
 
     # 建表
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    await migrate_order_table()
 
     await telegram_app.initialize()
 
@@ -1930,9 +2385,14 @@ async def startup():
         order_expiry_worker()
     )
 
+    if AUTO_PAYMENT_ENABLED:
+        tron_payment_task = asyncio.create_task(
+            tron_payment_worker()
+        )
+
 
 async def shutdown():
-    global order_expiry_task
+    global order_expiry_task, tron_payment_task
 
     if order_expiry_task is not None:
         order_expiry_task.cancel()
@@ -1943,6 +2403,16 @@ async def shutdown():
             pass
 
         order_expiry_task = None
+
+    if tron_payment_task is not None:
+        tron_payment_task.cancel()
+
+        try:
+            await tron_payment_task
+        except asyncio.CancelledError:
+            pass
+
+        tron_payment_task = None
 
     await telegram_app.shutdown()
     await engine.dispose()
