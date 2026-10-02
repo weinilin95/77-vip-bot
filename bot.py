@@ -60,6 +60,7 @@ from sqlalchemy.orm import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PUBLIC_CHANNEL_URL = os.environ["PUBLIC_CHANNEL_URL"]
+SUPPORT_URL = os.environ.get("SUPPORT_URL", "https://t.me/sunnys77")
 WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
 
 ADMIN_ID = int(os.environ["ADMIN_ID"])
@@ -403,6 +404,12 @@ def home_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "📢 返回 77限定",
                     url=PUBLIC_CHANNEL_URL,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "👩‍💼 聯繫客服",
+                    url=SUPPORT_URL,
                 )
             ],
         ]
