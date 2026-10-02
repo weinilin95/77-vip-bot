@@ -142,8 +142,11 @@ async def approve_vip(query, context, user_id):
 
     try:
         # 邀請連結 30 分鐘後失效
+        expire_time = datetime.now(timezone.utc) + timedelta(minutes=30)
+
         invite = await context.bot.create_chat_invite_link(
     chat_id=VIP_CHANNEL_ID,
+    expire_date=expire_time,
     name=f"VIP-{user_id}"
 )
 
@@ -157,13 +160,14 @@ async def approve_vip(query, context, user_id):
         ])
 
         await context.bot.send_message(
-    chat_id=user_id,
-    text=(
-        "🎉 你的 VIP 申請已通過！\n\n"
-        "下方是你的專屬加入連結 🔐"
-    ),
-    reply_markup=keyboard
-)
+            chat_id=user_id,
+            text=(
+                "🎉 你的 VIP 申請已通過！\n\n"
+                "下方是你的專屬加入連結 🔐\n\n"
+"⚠️ 此專屬連結將於 30 分鐘後失效。"
+            ),
+            reply_markup=keyboard
+        )
 
         await query.edit_message_text(
             query.message.text
