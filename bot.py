@@ -1,7 +1,7 @@
 import os
 import io
 import secrets
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -23,7 +23,7 @@ from telegram.ext import (
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 
@@ -38,136 +38,56 @@ WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 VIP_CHANNEL_ID = int(os.environ["VIP_CHANNEL_ID"])
 
-VIP_PRICE_TWD = Decimal(
-    os.environ.get("VIP_PRICE_TWD", "299")
+USDT_TRC20_ADDRESS = os.environ["USDT_TRC20_ADDRESS"]
+
+VIP_PRICE_USDT = Decimal(
+    os.environ.get("VIP_PRICE_USDT", "10")
 )
 
-USDT_TRC20_ADDRESS = os.environ["USDT_TRC20_ADDRESS"]
+TRADINGVIEW_WEBHOOK_SECRET = os.environ.get(
+    "TRADINGVIEW_WEBHOOK_SECRET",
+    ""
+)
+
+
+# TradingView 報價最大有效時間
+TRADINGVIEW_RATE_MAX_AGE = 600  # 10 分鐘
 
 
 telegram_app = (
-    Application
-    .builder()
+    Application.builder()
     .token(BOT_TOKEN)
     .build()
 )
 
 
 # =========================================================
-# 工具：取得 USDT / TWD 即時匯率
+# TradingView 最新報價
+# Render 重啟後會清空，屆時使用 CoinGecko 備援
 # =========================================================
 
-async def get_usdt_twd_rate():
-    """
-    取得 1 USDT 約等於多少 TWD。
-    使用 CoinGecko 公開 API。
-    """
-
-    url = (
-        "https://api.coingecko.com/api/v3/simple/price"
-    )
-
-    params = {
-        "ids": "tether",
-        "vs_currencies": "twd",
-    }
-
-    timeout = httpx.Timeout(10.0)
-
-    async with httpx.AsyncClient(
-        timeout=timeout
-    ) as client:
-
-        response = await client.get(
-            url,
-            params=params
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-    rate = data.get(
-        "tether",
-        {}
-    ).get(
-        "twd"
-    )
-
-    if rate is None:
-        raise ValueError(
-            "無法取得 USDT/TWD 匯率"
-        )
-
-    rate = Decimal(
-        str(rate)
-    )
-
-    if rate <= 0:
-        raise ValueError(
-            "USDT/TWD 匯率異常"
-        )
-
-    return rate
+tradingview_rate = {
+    "rate": None,
+    "updated_at": None,
+}
 
 
 # =========================================================
-# 工具：計算應付 USDT
-# =========================================================
-
-async def get_usdt_amount():
-    """
-    VIP 台幣價格 ÷ USDT/TWD 即時價格。
-
-    例如：
-    VIP_PRICE_TWD = 299
-    1 USDT = 31.90 TWD
-
-    299 / 31.90 = 約 9.38 USDT
-    """
-
-    rate = await get_usdt_twd_rate()
-
-    amount = (
-        VIP_PRICE_TWD
-        / rate
-    )
-
-    amount = amount.quantize(
-        Decimal("0.01"),
-        rounding=ROUND_UP
-    )
-
-    return rate, amount
-
-
-# =========================================================
-# 工具：建立訂單編號
+# 工具：產生訂單號
 # =========================================================
 
 def create_order_id():
-    now = datetime.now(
-        timezone.utc
-    )
+    now = datetime.now(timezone.utc)
 
-    date_text = now.strftime(
-        "%Y%m%d"
-    )
+    date_text = now.strftime("%Y%m%d")
 
-    random_text = (
-        secrets.token_hex(3)
-        .upper()
-    )
+    random_text = secrets.token_hex(3).upper()
 
-    return (
-        f"VIP"
-        f"{date_text}"
-        f"{random_text}"
-    )
+    return f"VIP{date_text}{random_text}"
 
 
 # =========================================================
-# 工具：產生 TRC20 QR Code
+# 工具：QR Code
 # =========================================================
 
 def create_usdt_qr(address):
@@ -178,10 +98,7 @@ def create_usdt_qr(address):
     )
 
     qr.add_data(address)
-
-    qr.make(
-        fit=True
-    )
+    qr.make(fit=True)
 
     image = qr.make_image(
         fill_color="black",
@@ -196,12 +113,233 @@ def create_usdt_qr(address):
     )
 
     output.seek(0)
-
-    output.name = (
-        "usdt_trc20.png"
-    )
+    output.name = "usdt_trc20.png"
 
     return output
+
+
+# =========================================================
+# CoinGecko 備援
+# =========================================================
+
+async def get_coingecko_rate():
+    """
+    取得 1 USDT 約等於多少台幣。
+    只有 TradingView 報價無法使用時才呼叫。
+    """
+
+    url = (
+        "https://api.coingecko.com/api/v3/simple/price"
+    )
+
+    params = {
+        "ids": "tether",
+        "vs_currencies": "twd"
+    }
+
+    timeout = httpx.Timeout(10.0)
+
+    last_error = None
+
+    # 最多自動重試 3 次
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout
+            ) as client:
+
+                response = await client.get(
+                    url,
+                    params=params
+                )
+
+                response.raise_for_status()
+
+                data = response.json()
+
+            rate = (
+                data.get("tether", {})
+                .get("twd")
+            )
+
+            if rate is None:
+                raise ValueError(
+                    "CoinGecko 沒有回傳 TWD"
+                )
+
+            rate = Decimal(str(rate))
+
+            if rate <= 0:
+                raise ValueError(
+                    "CoinGecko 匯率異常"
+                )
+
+            print(
+                f"Rate source: CoinGecko "
+                f"1 USDT = {rate} TWD"
+            )
+
+            return rate
+
+        except Exception as e:
+            last_error = e
+
+            print(
+                f"CoinGecko attempt "
+                f"{attempt + 1} failed: {e}"
+            )
+
+    raise RuntimeError(
+        f"CoinGecko rate failed: {last_error}"
+    )
+
+
+# =========================================================
+# 取得要顯示的 USDT / TWD 匯率
+# 優先 TradingView
+# =========================================================
+
+async def get_usdt_twd_rate():
+    """
+    優先順序：
+
+    1. TradingView Webhook 最新報價
+    2. CoinGecko 備援
+
+    匯率只供畫面顯示。
+    實際付款永遠固定 VIP_PRICE_USDT。
+    """
+
+    rate = tradingview_rate["rate"]
+    updated_at = tradingview_rate["updated_at"]
+
+    if rate is not None and updated_at is not None:
+
+        now = datetime.now(timezone.utc)
+
+        age = (
+            now - updated_at
+        ).total_seconds()
+
+        if age <= TRADINGVIEW_RATE_MAX_AGE:
+
+            print(
+                f"Rate source: TradingView "
+                f"1 USDT = {rate} TWD"
+            )
+
+            return rate, "TradingView"
+
+    # TradingView 沒資料或太舊
+    try:
+        backup_rate = await get_coingecko_rate()
+
+        return (
+            backup_rate,
+            "CoinGecko 備援"
+        )
+
+    except Exception as e:
+        print(
+            f"All rate sources failed: {e}"
+        )
+
+        return None, "暫時無法取得"
+
+
+# =========================================================
+# TradingView Webhook
+# =========================================================
+
+async def tradingview_webhook(request: Request):
+    """
+    TradingView Alert POST：
+
+    {
+      "secret": "你的密碼",
+      "rate_twd": "31.88"
+    }
+    """
+
+    try:
+        data = await request.json()
+
+    except Exception:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "invalid json"
+            },
+            status_code=400
+        )
+
+    secret = str(
+        data.get("secret", "")
+    )
+
+    if (
+        not TRADINGVIEW_WEBHOOK_SECRET
+        or secret != TRADINGVIEW_WEBHOOK_SECRET
+    ):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "unauthorized"
+            },
+            status_code=403
+        )
+
+    raw_rate = data.get("rate_twd")
+
+    if raw_rate is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "missing rate_twd"
+            },
+            status_code=400
+        )
+
+    try:
+        rate = Decimal(
+            str(raw_rate)
+        )
+
+    except Exception:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "invalid rate"
+            },
+            status_code=400
+        )
+
+    if rate <= 0:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "invalid rate"
+            },
+            status_code=400
+        )
+
+    tradingview_rate["rate"] = rate
+
+    tradingview_rate["updated_at"] = (
+        datetime.now(timezone.utc)
+    )
+
+    print(
+        f"TradingView rate updated: "
+        f"1 USDT = {rate} TWD"
+    )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "rate_twd": str(rate)
+        }
+    )
 
 
 # =========================================================
@@ -230,13 +368,11 @@ async def start(
     await update.message.reply_text(
         "✨ 歡迎來到 77VIP\n\n"
         "🔐 77VIP 專屬入口\n\n"
-        f"🔥 永久 VIP｜NT${VIP_PRICE_TWD}\n\n"
-        "💵 支援 USDT（TRC20）付款\n\n"
+        f"🔥 永久 VIP｜{VIP_PRICE_USDT} USDT\n\n"
+        "💵 USDT（TRC20）付款\n\n"
         "請選擇下方功能 👇",
-        reply_markup=(
-            InlineKeyboardMarkup(
-                keyboard
-            )
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
         )
     )
 
@@ -249,19 +385,16 @@ async def myid(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    user = (
-        update.effective_user
-    )
+    user = update.effective_user
 
     await update.message.reply_text(
-        "🆔 你的 Telegram ID：\n\n"
+        f"🆔 你的 Telegram ID：\n\n"
         f"{user.id}"
     )
 
 
 # =========================================================
 # 購買 VIP
-# 直接建立 USDT 訂單
 # =========================================================
 
 async def buy_vip(
@@ -270,10 +403,7 @@ async def buy_vip(
 ):
     user = query.from_user
 
-    # -----------------------------------------------------
-    # 已經是 VIP 就不需要再次購買
-    # -----------------------------------------------------
-
+    # 已經是 VIP
     try:
         member = (
             await context.bot.get_chat_member(
@@ -297,10 +427,7 @@ async def buy_vip(
     except Exception:
         pass
 
-    # -----------------------------------------------------
-    # 直接進入 USDT 建單
-    # -----------------------------------------------------
-
+    # 只有 USDT，因此直接建立訂單
     await pay_usdt(
         query,
         context
@@ -308,7 +435,7 @@ async def buy_vip(
 
 
 # =========================================================
-# USDT 訂單
+# 建立 USDT 訂單
 # =========================================================
 
 async def pay_usdt(
@@ -317,10 +444,7 @@ async def pay_usdt(
 ):
     user = query.from_user
 
-    # -----------------------------------------------------
-    # 顯示取得匯率中
-    # -----------------------------------------------------
-
+    # 顯示查詢中
     try:
         await query.edit_message_text(
             "⏳ 正在取得 USDT / TWD 即時匯率..."
@@ -330,83 +454,55 @@ async def pay_usdt(
         pass
 
     # -----------------------------------------------------
-    # 取得匯率
+    # 固定付款 10 USDT
     # -----------------------------------------------------
 
-    try:
-        rate, usdt_amount = (
-            await get_usdt_amount()
+    usdt_amount = VIP_PRICE_USDT
+
+    # -----------------------------------------------------
+    # 匯率只拿來顯示
+    # -----------------------------------------------------
+
+    rate, rate_source = (
+        await get_usdt_twd_rate()
+    )
+
+    if rate is not None:
+
+        twd_value = (
+            usdt_amount
+            * rate
+        ).quantize(
+            Decimal("0.01")
         )
 
-    except Exception as e:
-        print(
-            f"Rate API error: {e}"
-        )
-
-        keyboard = (
-            InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔄 重新取得匯率",
-                        callback_data="buy_vip"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏠 首頁",
-                        callback_data="home"
-                    )
-                ]
-            ])
-        )
-
-        try:
-            await query.edit_message_text(
-                "❌ 目前無法取得 USDT 即時匯率。\n\n"
-                "可能是報價服務暫時無法連線，"
-                "請稍後再試。",
-                reply_markup=keyboard
-            )
-
-        except Exception:
-            pass
-
-        return
+    else:
+        twd_value = None
 
     # -----------------------------------------------------
     # 建立訂單
     # -----------------------------------------------------
 
-    order_id = (
-        create_order_id()
-    )
+    order_id = create_order_id()
 
     expire_time = (
-        datetime.now(
-            timezone.utc
-        )
-        + timedelta(
-            minutes=30
-        )
+        datetime.now(timezone.utc)
+        + timedelta(minutes=30)
     )
 
-    # -----------------------------------------------------
-    # 儲存此訂單當下的匯率
-    # 建單後不再跟著價格變動
-    # -----------------------------------------------------
-
-    context.user_data[
-        "payment"
-    ] = {
+    context.user_data["payment"] = {
         "order_id": order_id,
-        "amount": str(
-            usdt_amount
+        "amount": str(usdt_amount),
+        "rate": (
+            str(rate)
+            if rate is not None
+            else "N/A"
         ),
-        "rate": str(
-            rate
-        ),
-        "price_twd": str(
-            VIP_PRICE_TWD
+        "rate_source": rate_source,
+        "twd_value": (
+            str(twd_value)
+            if twd_value is not None
+            else "N/A"
         ),
         "expire_timestamp": (
             expire_time.timestamp()
@@ -414,50 +510,70 @@ async def pay_usdt(
     }
 
     # -----------------------------------------------------
-    # QR Code
+    # QR
     # -----------------------------------------------------
 
-    qr_image = (
-        create_usdt_qr(
-            USDT_TRC20_ADDRESS
-        )
+    qr_image = create_usdt_qr(
+        USDT_TRC20_ADDRESS
     )
 
-    keyboard = (
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ 我已支付",
-                    callback_data="payment_done"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ 取消支付",
-                    callback_data="cancel_payment"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 首頁",
-                    callback_data="home"
-                )
-            ]
-        ])
-    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ 我已支付",
+                callback_data="payment_done"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ 取消支付",
+                callback_data="cancel_payment"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 首頁",
+                callback_data="home"
+            )
+        ]
+    ])
+
+    # -----------------------------------------------------
+    # 匯率文字
+    # -----------------------------------------------------
+
+    if rate is not None:
+
+        rate_text = (
+            f"💱 即時匯率："
+            f"1 USDT ≈ NT${rate}\n"
+            f"🇹🇼 約等值："
+            f"NT${twd_value}\n"
+            f"📊 匯率來源："
+            f"{rate_source}\n"
+        )
+
+    else:
+
+        rate_text = (
+            "💱 即時匯率："
+            "暫時無法取得\n"
+        )
+
+    # -----------------------------------------------------
+    # 訂單內容
+    # -----------------------------------------------------
 
     text = (
         "💵 USDT 付款\n\n"
 
-        f"📄 訂單號：{order_id}\n"
-
-        f"🔥 VIP價格：NT${VIP_PRICE_TWD}\n"
-
-        f"💱 即時匯率："
-        f"1 USDT ≈ NT${rate}\n"
+        f"📄 訂單號："
+        f"{order_id}\n"
 
         f"💰 支付金額："
-        f"{usdt_amount} USDT\n\n"
+        f"{usdt_amount} USDT\n"
+
+        f"{rate_text}\n"
 
         "📥 收款地址（TRC20）：\n"
         f"{USDT_TRC20_ADDRESS}\n\n"
@@ -466,8 +582,10 @@ async def pay_usdt(
 
         "⏰ 請在 30 分鐘內完成轉帳\n\n"
 
-        "⚠️ 此筆訂單建立後，"
-        "匯率與支付金額會鎖定 30 分鐘。\n"
+        f"✅ 實際應付金額固定為 "
+        f"{usdt_amount} USDT\n"
+
+        "ℹ️ 台幣換算僅供參考\n"
 
         "⚠️ 請務必使用 TRC20 網路\n"
 
@@ -480,10 +598,6 @@ async def pay_usdt(
         "✅ 我已支付"
     )
 
-    # -----------------------------------------------------
-    # 發送 QR Code + 訂單
-    # -----------------------------------------------------
-
     await context.bot.send_photo(
         chat_id=user.id,
         photo=qr_image,
@@ -493,7 +607,7 @@ async def pay_usdt(
 
 
 # =========================================================
-# 使用者表示已付款
+# 使用者按「我已支付」
 # =========================================================
 
 async def payment_done(
@@ -508,11 +622,8 @@ async def payment_done(
         )
     )
 
-    # -----------------------------------------------------
-    # 找不到訂單
-    # -----------------------------------------------------
-
     if not payment:
+
         await query.answer(
             "找不到有效訂單，請重新建立。",
             show_alert=True
@@ -520,23 +631,12 @@ async def payment_done(
 
         return
 
-    # -----------------------------------------------------
-    # 檢查是否超過 30 分鐘
-    # -----------------------------------------------------
+    now = datetime.now(
+        timezone.utc
+    ).timestamp()
 
-    now = (
-        datetime.now(
-            timezone.utc
-        )
-        .timestamp()
-    )
+    if now > payment["expire_timestamp"]:
 
-    if (
-        now
-        > payment[
-            "expire_timestamp"
-        ]
-    ):
         await query.answer(
             "此訂單已超過 30 分鐘，"
             "請重新建立訂單。",
@@ -545,21 +645,11 @@ async def payment_done(
 
         return
 
-    order_id = (
-        payment["order_id"]
-    )
-
-    amount = (
-        payment["amount"]
-    )
-
-    rate = (
-        payment["rate"]
-    )
-
-    price_twd = (
-        payment["price_twd"]
-    )
+    order_id = payment["order_id"]
+    amount = payment["amount"]
+    rate = payment["rate"]
+    rate_source = payment["rate_source"]
+    twd_value = payment["twd_value"]
 
     username = (
         f"@{user.username}"
@@ -567,69 +657,84 @@ async def payment_done(
         else "未設定"
     )
 
-    admin_keyboard = (
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ 確認收款",
-                    callback_data=(
-                        f"paidok:"
-                        f"{user.id}:"
-                        f"{order_id}"
-                    )
+    admin_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ 確認收款",
+                callback_data=(
+                    f"paidok:"
+                    f"{user.id}:"
+                    f"{order_id}"
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ 未收到款",
-                    callback_data=(
-                        f"paidno:"
-                        f"{user.id}:"
-                        f"{order_id}"
-                    )
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ 未收到款",
+                callback_data=(
+                    f"paidno:"
+                    f"{user.id}:"
+                    f"{order_id}"
                 )
-            ]
-        ])
+            )
+        ]
+    ])
+
+    # -----------------------------------------------------
+    # 管理員訊息
+    # -----------------------------------------------------
+
+    admin_text = (
+        "💰 新的 VIP 付款確認\n\n"
+
+        f"📄 訂單："
+        f"{order_id}\n"
+
+        f"💵 應付金額："
+        f"{amount} USDT\n"
     )
 
-    # -----------------------------------------------------
-    # 傳給管理員
-    # -----------------------------------------------------
+    if rate != "N/A":
 
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=(
-            "💰 新的 VIP 付款確認\n\n"
-
-            f"📄 訂單：{order_id}\n"
-
-            f"🔥 VIP價格："
-            f"NT${price_twd}\n"
-
+        admin_text += (
             f"💱 建單匯率："
             f"1 USDT ≈ NT${rate}\n"
 
-            f"💵 應付金額："
-            f"{amount} USDT\n\n"
+            f"🇹🇼 約等值："
+            f"NT${twd_value}\n"
 
-            f"👤 名稱："
-            f"{user.full_name}\n"
+            f"📊 匯率來源："
+            f"{rate_source}\n"
+        )
 
-            f"🔗 Username："
-            f"{username}\n"
+    admin_text += (
+        "\n"
 
-            f"🆔 User ID："
-            f"{user.id}\n\n"
+        f"👤 名稱："
+        f"{user.full_name}\n"
 
-            "⚠️ 請先確認自己的錢包／"
-            "交易紀錄，確定實際收到"
-            "款項後再批准。"
-        ),
+        f"🔗 Username："
+        f"{username}\n"
+
+        f"🆔 User ID："
+        f"{user.id}\n\n"
+
+        "⚠️ 請先確認自己的錢包／"
+        "交易紀錄。\n"
+
+        f"確認實際收到 "
+        f"{amount} USDT "
+        "後再批准。"
+    )
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=admin_text,
         reply_markup=admin_keyboard
     )
 
     # -----------------------------------------------------
-    # 修改使用者訂單畫面
+    # 修改會員付款畫面
     # -----------------------------------------------------
 
     await query.edit_message_caption(
@@ -650,7 +755,7 @@ async def payment_done(
 
 
 # =========================================================
-# 管理員確認收到款
+# 管理員確認收款
 # =========================================================
 
 async def payment_approve(
@@ -659,10 +764,8 @@ async def payment_approve(
     user_id,
     order_id
 ):
-    if (
-        query.from_user.id
-        != ADMIN_ID
-    ):
+    if query.from_user.id != ADMIN_ID:
+
         await query.answer(
             "你沒有管理員權限。",
             show_alert=True
@@ -673,36 +776,31 @@ async def payment_approve(
     try:
 
         # -------------------------------------------------
-        # 曾被移除 / 封鎖的會員
-        # 批准前自動解除封鎖
+        # 如果以前曾經被移除
+        # 先自動解除封鎖
         # -------------------------------------------------
 
         try:
-            await (
-                context.bot
-                .unban_chat_member(
-                    chat_id=VIP_CHANNEL_ID,
-                    user_id=user_id,
-                    only_if_banned=True
-                )
+
+            await context.bot.unban_chat_member(
+                chat_id=VIP_CHANNEL_ID,
+                user_id=user_id,
+                only_if_banned=True
             )
 
         except Exception as e:
+
             print(
                 f"Unban error: {e}"
             )
 
         # -------------------------------------------------
-        # 建立 30 分鐘 VIP 邀請
+        # VIP 邀請連結 30 分鐘
         # -------------------------------------------------
 
         expire_time = (
-            datetime.now(
-                timezone.utc
-            )
-            + timedelta(
-                minutes=30
-            )
+            datetime.now(timezone.utc)
+            + timedelta(minutes=30)
         )
 
         invite = (
@@ -714,18 +812,14 @@ async def payment_approve(
             )
         )
 
-        vip_keyboard = (
-            InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔐 進入 77VIP",
-                        url=(
-                            invite.invite_link
-                        )
-                    )
-                ]
-            ])
-        )
+        vip_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔐 進入 77VIP",
+                    url=invite.invite_link
+                )
+            ]
+        ])
 
         # -------------------------------------------------
         # 通知會員
@@ -753,7 +847,7 @@ async def payment_approve(
         )
 
         # -------------------------------------------------
-        # 更新管理員訊息
+        # 管理員訊息更新
         # -------------------------------------------------
 
         await query.edit_message_text(
@@ -766,8 +860,7 @@ async def payment_approve(
     except Exception as e:
 
         print(
-            "Payment approve error: "
-            f"{e}"
+            f"Payment approve error: {e}"
         )
 
         await context.bot.send_message(
@@ -797,10 +890,8 @@ async def payment_reject(
     user_id,
     order_id
 ):
-    if (
-        query.from_user.id
-        != ADMIN_ID
-    ):
+    if query.from_user.id != ADMIN_ID:
+
         await query.answer(
             "你沒有管理員權限。",
             show_alert=True
@@ -809,6 +900,7 @@ async def payment_reject(
         return
 
     try:
+
         await context.bot.send_message(
             chat_id=user_id,
             text=(
@@ -823,9 +915,9 @@ async def payment_reject(
 
                 "• 收款地址是否正確\n"
 
-                "• 交易是否已完成\n"
+                "• 是否實際轉出 10 USDT\n"
 
-                "• 實際到帳金額是否正確\n\n"
+                "• 交易是否已完成\n\n"
 
                 "如已付款，可稍後再聯絡"
                 "管理員確認。"
@@ -839,14 +931,14 @@ async def payment_reject(
         )
 
     except Exception as e:
+
         print(
-            "Payment reject error: "
-            f"{e}"
+            f"Payment reject error: {e}"
         )
 
 
 # =========================================================
-# 取消付款
+# 取消訂單
 # =========================================================
 
 async def cancel_payment(
@@ -858,32 +950,30 @@ async def cancel_payment(
         None
     )
 
-    keyboard = (
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔥 重新購買 VIP",
-                    callback_data="buy_vip"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 首頁",
-                    callback_data="home"
-                )
-            ]
-        ])
-    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔥 重新購買 VIP",
+                callback_data="buy_vip"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 首頁",
+                callback_data="home"
+            )
+        ]
+    ])
 
     try:
+
         await query.edit_message_caption(
-            caption=(
-                "❌ 訂單已取消。"
-            ),
+            caption="❌ 訂單已取消。",
             reply_markup=keyboard
         )
 
     except Exception:
+
         await query.edit_message_text(
             "❌ 訂單已取消。",
             reply_markup=keyboard
@@ -892,38 +982,24 @@ async def cancel_payment(
 
 # =========================================================
 # VIP 加入成功
-# 自動撤銷邀請連結
+# 自動撤銷專屬邀請連結
 # =========================================================
 
 async def vip_member_update(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    member_update = (
-        update.chat_member
-    )
+    member_update = update.chat_member
 
     if not member_update:
         return
 
-    # -----------------------------------------------------
-    # 只處理指定 VIP 頻道
-    # -----------------------------------------------------
-
-    if (
-        member_update.chat.id
-        != VIP_CHANNEL_ID
-    ):
+    if member_update.chat.id != VIP_CHANNEL_ID:
         return
 
     new_member = (
-        member_update
-        .new_chat_member
+        member_update.new_chat_member
     )
-
-    # -----------------------------------------------------
-    # 確認使用者真的已加入
-    # -----------------------------------------------------
 
     if new_member.status not in [
         "member",
@@ -932,9 +1008,7 @@ async def vip_member_update(
     ]:
         return
 
-    user = (
-        new_member.user
-    )
+    user = new_member.user
 
     invite_link = (
         member_update.invite_link
@@ -947,30 +1021,19 @@ async def vip_member_update(
         f"VIP-{user.id}"
     )
 
-    # -----------------------------------------------------
-    # 只撤銷屬於該 User ID 的專屬連結
-    # -----------------------------------------------------
-
-    if (
-        invite_link.name
-        != expected_name
-    ):
+    if invite_link.name != expected_name:
         return
 
     try:
 
         # -------------------------------------------------
-        # 撤銷專屬邀請連結
+        # 撤銷邀請
         # -------------------------------------------------
 
-        await (
-            context.bot
-            .revoke_chat_invite_link(
-                chat_id=VIP_CHANNEL_ID,
-                invite_link=(
-                    invite_link
-                    .invite_link
-                )
+        await context.bot.revoke_chat_invite_link(
+            chat_id=VIP_CHANNEL_ID,
+            invite_link=(
+                invite_link.invite_link
             )
         )
 
@@ -1017,9 +1080,9 @@ async def vip_member_update(
         )
 
     except Exception as e:
+
         print(
-            "Revoke invite error: "
-            f"{e}"
+            f"Revoke invite error: {e}"
         )
 
 
@@ -1031,22 +1094,20 @@ async def show_home(
     query,
     context
 ):
-    keyboard = (
-        InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔥 購買永久 VIP",
-                    callback_data="buy_vip"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📢 返回 77限定",
-                    url=PUBLIC_CHANNEL_URL
-                )
-            ]
-        ])
-    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔥 購買永久 VIP",
+                callback_data="buy_vip"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 返回 77限定",
+                url=PUBLIC_CHANNEL_URL
+            )
+        ]
+    ])
 
     home_text = (
         "✨ 歡迎來到 77VIP\n\n"
@@ -1054,18 +1115,20 @@ async def show_home(
         "🔐 77VIP 專屬入口\n\n"
 
         f"🔥 永久 VIP｜"
-        f"NT${VIP_PRICE_TWD}\n\n"
+        f"{VIP_PRICE_USDT} USDT\n\n"
 
-        "💵 支援 USDT（TRC20）付款"
+        "💵 USDT（TRC20）付款"
     )
 
     try:
+
         await query.edit_message_caption(
             caption=home_text,
             reply_markup=keyboard
         )
 
     except Exception:
+
         await query.edit_message_text(
             home_text,
             reply_markup=keyboard
@@ -1080,22 +1143,18 @@ async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    query = (
-        update.callback_query
-    )
+    query = update.callback_query
 
     await query.answer()
 
-    data = (
-        query.data
-    )
+    data = query.data
 
     # -----------------------------------------------------
-    # 購買 VIP
-    # 直接進入 USDT
+    # 購買
     # -----------------------------------------------------
 
     if data == "buy_vip":
+
         await buy_vip(
             query,
             context
@@ -1104,10 +1163,11 @@ async def button_handler(
         return
 
     # -----------------------------------------------------
-    # 已付款
+    # 已支付
     # -----------------------------------------------------
 
     if data == "payment_done":
+
         await payment_done(
             query,
             context
@@ -1116,10 +1176,11 @@ async def button_handler(
         return
 
     # -----------------------------------------------------
-    # 取消付款
+    # 取消
     # -----------------------------------------------------
 
     if data == "cancel_payment":
+
         await cancel_payment(
             query,
             context
@@ -1132,6 +1193,7 @@ async def button_handler(
     # -----------------------------------------------------
 
     if data == "home":
+
         await show_home(
             query,
             context
@@ -1140,23 +1202,15 @@ async def button_handler(
         return
 
     # -----------------------------------------------------
-    # 管理員確認收款
+    # 管理員確認
     # -----------------------------------------------------
 
-    if data.startswith(
-        "paidok:"
-    ):
-        parts = (
-            data.split(":")
-        )
+    if data.startswith("paidok:"):
 
-        user_id = int(
-            parts[1]
-        )
+        parts = data.split(":")
 
-        order_id = (
-            parts[2]
-        )
+        user_id = int(parts[1])
+        order_id = parts[2]
 
         await payment_approve(
             query,
@@ -1168,23 +1222,15 @@ async def button_handler(
         return
 
     # -----------------------------------------------------
-    # 管理員：未收到款
+    # 管理員拒絕
     # -----------------------------------------------------
 
-    if data.startswith(
-        "paidno:"
-    ):
-        parts = (
-            data.split(":")
-        )
+    if data.startswith("paidno:"):
 
-        user_id = int(
-            parts[1]
-        )
+        parts = data.split(":")
 
-        order_id = (
-            parts[2]
-        )
+        user_id = int(parts[1])
+        order_id = parts[2]
 
         await payment_reject(
             query,
@@ -1235,8 +1281,26 @@ telegram_app.add_handler(
 async def homepage(
     request: Request
 ):
+    rate = tradingview_rate["rate"]
+    updated_at = tradingview_rate["updated_at"]
+
+    if rate is not None:
+
+        rate_status = (
+            f"\nTradingView Rate: "
+            f"1 USDT = {rate} TWD"
+        )
+
+    else:
+
+        rate_status = (
+            "\nTradingView Rate: "
+            "Waiting for webhook"
+        )
+
     return PlainTextResponse(
-        "77 VIP Bot V4 USDT/TWD is running!"
+        "77 VIP Bot V5 is running!"
+        + rate_status
     )
 
 
@@ -1244,25 +1308,18 @@ async def homepage(
 # Telegram Webhook
 # =========================================================
 
-async def webhook(
+async def telegram_webhook(
     request: Request
 ):
-    data = (
-        await request.json()
+    data = await request.json()
+
+    update = Update.de_json(
+        data=data,
+        bot=telegram_app.bot
     )
 
-    update = (
-        Update.de_json(
-            data=data,
-            bot=telegram_app.bot
-        )
-    )
-
-    await (
-        telegram_app
-        .process_update(
-            update
-        )
+    await telegram_app.process_update(
+        update
     )
 
     return PlainTextResponse(
@@ -1275,24 +1332,16 @@ async def webhook(
 # =========================================================
 
 async def startup():
-    await (
-        telegram_app
-        .initialize()
-    )
 
-    await (
-        telegram_app.bot
-        .set_webhook(
-            url=(
-                f"{WEBHOOK_URL}"
-                "/webhook"
-            ),
-            allowed_updates=[
-                "message",
-                "callback_query",
-                "chat_member",
-            ]
-        )
+    await telegram_app.initialize()
+
+    await telegram_app.bot.set_webhook(
+        url=f"{WEBHOOK_URL}/webhook",
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "chat_member",
+        ]
     )
 
 
@@ -1301,14 +1350,12 @@ async def startup():
 # =========================================================
 
 async def shutdown():
-    await (
-        telegram_app
-        .shutdown()
-    )
+
+    await telegram_app.shutdown()
 
 
 # =========================================================
-# Starlette App
+# Starlette
 # =========================================================
 
 app = Starlette(
@@ -1321,9 +1368,18 @@ app = Starlette(
                 "HEAD"
             ]
         ),
+
         Route(
             "/webhook",
-            webhook,
+            telegram_webhook,
+            methods=[
+                "POST"
+            ]
+        ),
+
+        Route(
+            "/tradingview-rate",
+            tradingview_webhook,
             methods=[
                 "POST"
             ]
